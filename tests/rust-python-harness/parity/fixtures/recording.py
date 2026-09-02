@@ -13,7 +13,7 @@ import httpx
 from vcr.filters import remove_query_parameters
 from vcr.request import Request
 
-from tests.provider_record_replay.http import (
+from ..http import (
     dropped_request_headers,
     dropped_response_headers,
     is_streaming_response,

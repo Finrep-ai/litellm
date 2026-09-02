@@ -94,11 +94,6 @@ from fixture_mode import (
     current_test_key,
     parse_fixture_mode,
 )
-from tests.provider_record_replay.http import (
-    dropped_request_headers,
-    dropped_response_headers,
-    is_streaming_response,
-)
 
 EDGE_MOUNTS: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -108,6 +103,29 @@ EDGE_MOUNTS: Final[Mapping[str, str]] = MappingProxyType(
 )
 
 REPLAY_MISS_STATUS: Final = 599
+
+_HOP_BY_HOP_HEADERS: Final[frozenset[str]] = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+_REQUEST_DROPPED_HEADERS: Final[frozenset[str]] = _HOP_BY_HOP_HEADERS | {
+    "host",
+    "content-length",
+    "accept-encoding",
+}
+_RESPONSE_DROPPED_HEADERS: Final[frozenset[str]] = _HOP_BY_HOP_HEADERS | {
+    "content-encoding",
+    "content-length",
+    "set-cookie",
+}
 
 _JSON: Final[TypeAdapter[JsonValue]] = TypeAdapter(JsonValue)
 
@@ -548,8 +566,9 @@ def _filtered_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
     """What the edge stores and serves: the provider's headers minus hop-by-hop and
     volatile entries. Framing headers are in that set, so a stored header can never
     contradict the framing the edge chooses when it serves the response."""
-    excluded: Final = dropped_response_headers(headers.items())
-    return {name: value for name, value in headers.items() if name.lower() not in excluded}
+    return {
+        name: value for name, value in headers.items() if name not in _RESPONSE_DROPPED_HEADERS
+    }
 
 
 def _network_error_response(message: str) -> RecordedHttpResponse:
@@ -591,7 +610,7 @@ def _is_streamed(headers: Mapping[str, str]) -> bool:
     move nearly every recording to the streamed shape for no gain. The content type
     is the header that says "consume this as it arrives", and it is already how the
     harness defines streaming everywhere else."""
-    return is_streaming_response(_header_value(headers, "content-type"))
+    return "text/event-stream" in _header_value(headers, "content-type").lower()
 
 
 def _upstream_url(upstream_base: str, upstream_path: str, query: str) -> str:
@@ -679,9 +698,8 @@ def _handle_record(
     timeout: float,
 ) -> EdgeOutcome:
     test_key: Final = current_test_key()
-    excluded: Final = dropped_request_headers(headers.items())
     forwarded: Final = {
-        name: value for name, value in headers.items() if name.lower() not in excluded
+        name: value for name, value in headers.items() if name.lower() not in _REQUEST_DROPPED_HEADERS
     }
     head: Final = forward_stream(method, url, headers=forwarded, body=body, timeout=timeout)
     match head:

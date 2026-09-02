@@ -65,7 +65,7 @@ def _process_image_response(response: Response, url: str) -> str:
             )
         img_type = _img_type
     else:
-        img_type = image_type.partition(";")[0].strip().lower()
+        img_type = image_type
 
     result: Final = f"data:{img_type};base64,{base64_image}"
     in_memory_cache.set_cache(url, result)
