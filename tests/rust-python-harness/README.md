@@ -19,6 +19,8 @@ The harness has three deliberately broad test-strategy folders:
 
 ## Run it
 
+This harness is manual-only. CI does not run its parity tests, fixture-generation checks, or recording commands
+
 From the repository root:
 
 ```bash
