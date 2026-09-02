@@ -108,7 +108,7 @@ their LOC thresholds. Generated Rust LCOV/HTML and the combined index also belon
 | `n/a` | Strategy does not apply to this SDK function |
 | `◐` | The configured tests cover only part of the TDD's parity contract |
 
-The initial end-to-end entries deliberately show `◐`: the repository has Rust bridge tests for OCR, Messages, and Responses websocket plumbing, but those are not yet frozen-Python-oracle comparisons. The remaining TDD cells stay visible as planned work instead of disappearing from a green summary.
+OCR runs committed provider recordings through both SDK implementations. Its bridge checks live under `validate_sub_methods/ocr/`. OCR remains partial because Reducto lacks a Rust contract. Messages and Responses retain their partial bridge coverage, and unimplemented cells remain planned
 
 ## Attach parity tests
 
@@ -143,3 +143,31 @@ Keep comparison mechanics in shared harness modules and provider/function facts 
 - `cli.py` handles filtering and preserves pytest exit semantics.
 
 The harness is driven from Python, matching the SDK surface and existing test tooling. Rust remains responsible for the implementation under comparison; the harness does not move provider semantics into the PyO3 bridge.
+
+## OCR fixtures and harness checks
+
+`parity/` owns shared recording, replay, comparison, streaming, media generation, and cassette persistence. `e2e_fuzz_tests/ocr/` owns OCR input strategies, provider configuration, fixture generation, committed cassettes, and SDK parity tests. `validate_sub_methods/ocr/` owns focused OCR bridge tests
+
+Run recorded OCR parity without provider credentials:
+
+```bash
+uv run python -m tests.rust-python-harness --strategy e2e_fuzz_tests --function ocr --plain
+```
+
+Generate or refresh provider fixtures with configured credentials:
+
+```bash
+uv run python -m tests.rust-python-harness.e2e_fuzz_tests.ocr.fixtures.record --examples 1000
+```
+
+See [OCR fixture setup](e2e_fuzz_tests/ocr/fixtures/README.md) for provider credentials, input generation, and migration. `LITELLM_OCR_FIXTURE_DIR` and `--fixture-dir` still override the default cassette directory
+
+Run the shared machinery and OCR fixture-generation checks alongside parity:
+
+```bash
+uv run pytest tests/rust-python-harness tests/test_rust_python_harness.py -q
+```
+
+Pytest enables namespace-package discovery in `pyproject.toml` so the existing hyphenated harness directory supports relative imports. Subprocess parity workers use the same package through `python -m`
+
+The small `tests/provider_record_replay/http.py` header helper stays shared with the proxy E2E recorder; all SDK parity machinery and OCR fixture assets live here
