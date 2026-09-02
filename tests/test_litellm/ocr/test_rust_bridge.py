@@ -3,13 +3,16 @@
 import builtins
 import importlib
 import types
-from typing import Any
+from typing import Any, Final
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 import litellm
 from litellm.llms.base_llm.ocr.transformation import OCRResponse
+from litellm.rust_bridge import configuration
 
 # `litellm/__init__.py` does `from .ocr.main import *`, which binds the `ocr`
 # function onto `litellm.ocr` and shadows the submodule, so import the modules
@@ -214,10 +217,12 @@ def build_prepared_request(
 @pytest.fixture(autouse=True)
 def _reset_rust_flag():
     """Keep the global toggle isolated between tests."""
-    rust_bridge.use_litellm_rust(False, ocr=None, aocr=None)
+    rust_bridge.set_rust_ocr(ocr=None, aocr=None)
+    configuration.reset_rust_configuration()
     rust_bridge_loader._cached_bridge = rust_bridge_loader._BRIDGE_SENTINEL
     yield
-    rust_bridge.use_litellm_rust(False, ocr=None, aocr=None)
+    rust_bridge.set_rust_ocr(ocr=None, aocr=None)
+    configuration.reset_rust_configuration()
     rust_bridge_loader._cached_bridge = rust_bridge_loader._BRIDGE_SENTINEL
 
 
@@ -247,7 +252,14 @@ def test_use_litellm_rust_toggles_flag():
 
 def test_env_var_enables_rust_ocr(monkeypatch):
     monkeypatch.setenv("LITELLM_USE_RUST_OCR", "1")
-    assert rust_bridge._env_enables_rust_ocr() is True
+    with pytest.warns(DeprecationWarning, match="LITELLM_USE_RUST_OCR is deprecated"):
+        assert rust_bridge.rust_ocr_enabled() is True
+
+
+def test_explicit_false_overrides_process_enable():
+    litellm.use_litellm_rust(True)
+
+    assert ocr_main._rust_ocr_enabled(build_prepared_request(litellm_params={"rust": False})) is False
 
 
 def test_load_rust_ocr_returns_injected_impl():
@@ -483,9 +495,7 @@ def test_run_rust_ocr_resolves_key_via_secret_manager_when_missing():
 
     ocr_main._run_rust_ocr(
         prepared_request=build_prepared_request(api_key=None, timeout=None),
-        resolve_api_key=lambda name: (
-            "sk-from-vault" if name == "MISTRAL_API_KEY" else None
-        ),
+        resolve_api_key=lambda name: "sk-from-vault" if name == "MISTRAL_API_KEY" else None,
     )
 
     assert bridge.calls[0]["api_key"] == "sk-from-vault"
@@ -592,9 +602,7 @@ def test_prepare_rust_ocr_call_resolves_azure_ai_api_base_from_secret_manager():
             api_base=None,
             timeout=None,
         ),
-        resolve_api_key=lambda name: (
-            "https://azure.example.com" if name == "AZURE_AI_API_BASE" else None
-        ),
+        resolve_api_key=lambda name: "https://azure.example.com" if name == "AZURE_AI_API_BASE" else None,
     )
 
     assert bridge.calls[0]["api_base"] == "https://azure.example.com"
@@ -612,9 +620,7 @@ def test_prepare_rust_ocr_call_resolves_document_intelligence_endpoint():
             timeout=None,
         ),
         resolve_api_key=lambda name: (
-            "https://document-intelligence.example.com"
-            if name == "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"
-            else None
+            "https://document-intelligence.example.com" if name == "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT" else None
         ),
     )
 
@@ -864,9 +870,123 @@ def test_ocr_provider_configs_expose_api_key_env_vars():
     assert BaseOCRConfig().get_api_key_env_var() is None
     assert MistralOCRConfig().get_api_key_env_var() == "MISTRAL_API_KEY"
     assert AzureAIOCRConfig().get_api_key_env_var() == "AZURE_AI_API_KEY"
-    assert (
-        AzureDocumentIntelligenceOCRConfig().get_api_key_env_var()
-        == "AZURE_DOCUMENT_INTELLIGENCE_API_KEY"
-    )
+    assert AzureDocumentIntelligenceOCRConfig().get_api_key_env_var() == "AZURE_DOCUMENT_INTELLIGENCE_API_KEY"
     assert VertexAIOCRConfig().get_api_key_env_var() == "VERTEX_AI_API_KEY"
     assert VertexAIDeepSeekOCRConfig().get_api_key_env_var() == "VERTEX_AI_API_KEY"
+
+
+class NativeUpstreamError(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", (False, True), ids=("sync", "async"))
+@pytest.mark.parametrize(
+    ("status", "expected_status", "expected_exception"),
+    (
+        (400, 400, litellm.BadRequestError),
+        (401, 401, litellm.AuthenticationError),
+        (429, 429, litellm.RateLimitError),
+        (503, 503, litellm.ServiceUnavailableError),
+        (0, 500, litellm.InternalServerError),
+    ),
+)
+async def test_native_ocr_errors_preserve_public_status_and_message(
+    monkeypatch: pytest.MonkeyPatch,
+    asynchronous: bool,
+    status: int,
+    expected_status: int,
+    expected_exception: type[Exception],
+) -> None:
+    native_error: Final = NativeUpstreamError(status, "provider rejected OCR request")
+    sync_call: Final = Mock(side_effect=native_error)
+    async_call: Final = AsyncMock(side_effect=native_error)
+    native_module: Final = types.SimpleNamespace(RustUpstreamError=NativeUpstreamError)
+    monkeypatch.setattr(importlib.import_module("litellm.rust_bridge"), "get_native_bridge", lambda: native_module)
+    litellm.use_litellm_rust(True)
+    rust_bridge.set_rust_ocr(ocr=sync_call, aocr=async_call)
+
+    async def invoke() -> None:
+        if asynchronous:
+            await litellm.aocr(model=MODEL, document=DOCUMENT, api_key="sk-test", api_base="https://ocr.example.com/v1")
+        else:
+            litellm.ocr(model=MODEL, document=DOCUMENT, api_key="sk-test", api_base="https://ocr.example.com/v1")
+
+    with pytest.raises(expected_exception) as caught:
+        await invoke()
+
+    assert caught.value.status_code == expected_status
+    assert "provider rejected OCR request" in str(caught.value)
+    assert caught.value.response.status_code == expected_status
+    if asynchronous:
+        async_call.assert_awaited_once()
+        sync_call.assert_not_called()
+    else:
+        sync_call.assert_called_once()
+        async_call.assert_not_called()
+
+
+@pytest.mark.parametrize("error_type", (None, "RustUpstreamError", int, NativeUpstreamError))
+def test_ocr_error_mapping_preserves_unrelated_errors(monkeypatch: pytest.MonkeyPatch, error_type: object) -> None:
+    native_module: Final = types.SimpleNamespace(RustUpstreamError=error_type)
+    monkeypatch.setattr(importlib.import_module("litellm.rust_bridge"), "get_native_bridge", lambda: native_module)
+    original: Final = ValueError("invalid document")
+
+    with pytest.raises(ValueError, match="invalid document") as caught, rust_bridge._map_ocr_errors(None):
+        raise original
+
+    assert caught.value is original
+
+
+@pytest.mark.parametrize("request_url", (None, "https://ocr.example.com/v1/ocr"))
+def test_ocr_error_mapping_preserves_native_cause(monkeypatch: pytest.MonkeyPatch, request_url: str | None) -> None:
+    native_module: Final = types.SimpleNamespace(RustUpstreamError=NativeUpstreamError)
+    monkeypatch.setattr(importlib.import_module("litellm.rust_bridge"), "get_native_bridge", lambda: native_module)
+    original: Final = NativeUpstreamError(429, "rate limited")
+
+    with pytest.raises(rust_bridge._OcrProviderError) as caught, rust_bridge._map_ocr_errors(request_url):
+        raise original
+
+    assert caught.value.__cause__ is original
+    assert caught.value.status_code == 429
+    assert str(caught.value) == "rate limited"
+    if request_url is not None:
+        assert str(caught.value.response.request.url) == request_url
+    else:
+        with pytest.raises(RuntimeError, match="request instance has not been set"):
+            _ = caught.value.response.request
+
+
+@pytest.mark.parametrize("args", (("429", "rate limited"), (429, 123), (429,), (429, "rate limited", "extra")))
+def test_ocr_error_mapping_rejects_malformed_native_errors(
+    monkeypatch: pytest.MonkeyPatch, args: tuple[object, ...]
+) -> None:
+    native_module: Final = types.SimpleNamespace(RustUpstreamError=NativeUpstreamError)
+    monkeypatch.setattr(importlib.import_module("litellm.rust_bridge"), "get_native_bridge", lambda: native_module)
+
+    with pytest.raises(ValidationError), rust_bridge._map_ocr_errors(None):
+        raise NativeUpstreamError(*args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", (False, True), ids=("sync", "async"))
+async def test_prepared_ocr_error_uses_resolved_request_url(
+    monkeypatch: pytest.MonkeyPatch, asynchronous: bool
+) -> None:
+    native_module: Final = types.SimpleNamespace(RustUpstreamError=NativeUpstreamError)
+    monkeypatch.setattr(importlib.import_module("litellm.rust_bridge"), "get_native_bridge", lambda: native_module)
+    original: Final = NativeUpstreamError(429, "rate limited")
+    rust_bridge.set_rust_ocr(ocr=Mock(side_effect=original), aocr=AsyncMock(side_effect=original))
+    prepared: Final = build_prepared_request(api_base="https://ocr.example.com/v1")
+
+    async def invoke() -> None:
+        if asynchronous:
+            await ocr_main._run_rust_aocr(prepared_request=prepared, resolve_api_key=lambda _name: None)
+        else:
+            ocr_main._run_rust_ocr(prepared_request=prepared, resolve_api_key=lambda _name: None)
+
+    with pytest.raises(rust_bridge._OcrProviderError) as caught:
+        await invoke()
+
+    assert caught.value.__cause__ is original
+    assert str(caught.value.response.request.url) == "https://ocr.example.com/v1/ocr"
