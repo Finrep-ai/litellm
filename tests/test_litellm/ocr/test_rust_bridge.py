@@ -1,7 +1,7 @@
 """Tests for the optional Rust-backed OCR path."""
 
-import importlib
 import builtins
+import importlib
 import types
 from typing import Any
 
@@ -371,6 +371,18 @@ def test_timeout_to_seconds_handles_float_timeout_and_none():
     assert rust_bridge._timeout_to_seconds(httpx.Timeout(30.0, read=42.0)) == 42.0
 
 
+def test_ocr_provider_error_uses_resolved_request_url():
+    error = rust_bridge._OcrProviderError(
+        429,
+        "rate limited",
+        "https://example.azure.com/documentintelligence/documentModels/read:analyze",
+    )
+
+    assert str(error.response.request.url) == (
+        "https://example.azure.com/documentintelligence/documentModels/read:analyze"
+    )
+
+
 def test_bridge_wrapper_forwards_prepared_args_and_wraps_response():
     bridge = RecordingBridge()
 
@@ -662,18 +674,34 @@ def test_ocr_routes_to_rust_when_enabled(fake_bridge):
     assert call["optional_params"].get("include_image_base64") is True
 
 
-def test_ocr_routes_azure_ai_to_rust_when_enabled(fake_bridge):
+@pytest.mark.parametrize(
+    ("model", "provider"),
+    (
+        ("azure_ai/pixtral-12b-2409", "azure_ai"),
+        ("vertex_ai/mistral-ocr-2505", "vertex_ai"),
+    ),
+)
+def test_ocr_routes_supported_provider_to_rust(
+    fake_bridge: RecordingBridge,
+    model: str,
+    provider: str,
+) -> None:
+    provider_kwargs: dict[str, object] = (
+        {"vertex_project": "project-1", "vertex_location": "us-central1"} if provider == "vertex_ai" else {}
+    )
     response = litellm.ocr(
-        model="azure_ai/pixtral-12b-2409",
+        model=model,
         document=DOCUMENT,
         api_key="sk-test",
-        api_base="https://example.services.ai.azure.com",
+        api_base="https://example.com",
+        **provider_kwargs,
     )
 
     assert isinstance(response, OCRResponse)
     assert len(fake_bridge.calls) == 1
-    assert fake_bridge.calls[0]["model"] == "pixtral-12b-2409"
-    assert fake_bridge.calls[0]["custom_llm_provider"] == "azure_ai"
+    call = fake_bridge.calls[0]
+    assert call["model"] == model.rsplit("/", 1)[-1]
+    assert call["custom_llm_provider"] == provider
 
 
 def test_ocr_rust_path_converts_file_document_before_bridge(fake_bridge):
@@ -798,6 +826,27 @@ def test_ocr_falls_back_to_python_when_bridge_unavailable(monkeypatch):
 
     assert captured.get("called") is True  # Python path was used
     assert isinstance(response, OCRResponse)
+
+
+def test_ocr_non_string_header_uses_python_path(monkeypatch):
+    bridge = RecordingBridge()
+    litellm.use_litellm_rust(True, ocr=bridge)
+
+    def fake_handler_ocr(**kwargs):
+        assert kwargs["headers"] == {"x-invalid": 1}
+        return OCRResponse(pages=[], model="mistral-ocr-latest", object="ocr")
+
+    monkeypatch.setattr(ocr_main.base_llm_http_handler, "ocr", fake_handler_ocr)
+
+    response = litellm.ocr(
+        model=MODEL,
+        document=DOCUMENT,
+        api_key="sk-test",
+        extra_headers={"x-invalid": 1},
+    )
+
+    assert isinstance(response, OCRResponse)
+    assert bridge.calls == []
 
 
 def test_ocr_provider_configs_expose_api_key_env_vars():

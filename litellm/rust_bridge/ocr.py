@@ -3,15 +3,41 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Generator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Final, Protocol, cast
 
 import httpx
+from pydantic import TypeAdapter
 
 from litellm.rust_bridge.timeouts import timeout_to_seconds as _timeout_to_seconds
 
 if TYPE_CHECKING:
     from litellm.rust_bridge.messages import RustAmessages, RustMessages
+
+
+class _OcrProviderError(Exception):
+    def __init__(self, status_code: int, message: str, request_url: str | None) -> None:
+        super().__init__(message)
+        self.status_code: Final = status_code
+        request: Final = httpx.Request("POST", request_url) if request_url is not None else None
+        self.response: Final = httpx.Response(status_code=status_code, request=request)
+
+
+@contextmanager
+def _map_ocr_errors(request_url: str | None) -> Generator[None]:
+    from litellm.rust_bridge import get_native_bridge
+
+    native_bridge: Final = get_native_bridge()
+    error_type: Final = getattr(native_bridge, "RustUpstreamError", None)
+    upstream_errors: Final[tuple[type[Exception], ...]] = (
+        (error_type,) if isinstance(error_type, type) and issubclass(error_type, Exception) else ()
+    )
+    try:
+        yield
+    except upstream_errors as error:
+        status, message = TypeAdapter(tuple[int, str]).validate_python(error.args, strict=True)
+        raise _OcrProviderError(status or 500, message, request_url) from error
 
 
 class RustOcr(Protocol):
@@ -148,20 +174,22 @@ def ocr(
     extra_headers: dict[str, object] | None,
     optional_params: dict[str, object],
     timeout: float | httpx.Timeout | None,
+    request_url: str | None = None,
 ) -> dict[str, object] | None:
     rust_ocr: Final = load_rust_ocr()
     if rust_ocr is None:
         return None
-    return rust_ocr(
-        model=model,
-        document=document,
-        api_key=api_key,
-        api_base=api_base,
-        custom_llm_provider=custom_llm_provider,
-        extra_headers=extra_headers,
-        optional_params=optional_params,
-        timeout_seconds=_timeout_to_seconds(timeout),
-    )
+    with _map_ocr_errors(request_url):
+        return rust_ocr(
+            model=model,
+            document=document,
+            api_key=api_key,
+            api_base=api_base,
+            custom_llm_provider=custom_llm_provider,
+            extra_headers=extra_headers,
+            optional_params=optional_params,
+            timeout_seconds=_timeout_to_seconds(timeout),
+        )
 
 
 async def aocr(
@@ -174,17 +202,19 @@ async def aocr(
     extra_headers: dict[str, object] | None,
     optional_params: dict[str, object],
     timeout: float | httpx.Timeout | None,
+    request_url: str | None = None,
 ) -> dict[str, object] | None:
     rust_aocr: Final = load_rust_aocr()
     if rust_aocr is None:
         return None
-    return await rust_aocr(
-        model=model,
-        document=document,
-        api_key=api_key,
-        api_base=api_base,
-        custom_llm_provider=custom_llm_provider,
-        extra_headers=extra_headers,
-        optional_params=optional_params,
-        timeout_seconds=_timeout_to_seconds(timeout),
-    )
+    with _map_ocr_errors(request_url):
+        return await rust_aocr(
+            model=model,
+            document=document,
+            api_key=api_key,
+            api_base=api_base,
+            custom_llm_provider=custom_llm_provider,
+            extra_headers=extra_headers,
+            optional_params=optional_params,
+            timeout_seconds=_timeout_to_seconds(timeout),
+        )

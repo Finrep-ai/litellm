@@ -65,6 +65,16 @@ fn core_error_to_pyerr(err: Error) -> PyErr {
     }
 }
 
+fn ocr_error_to_pyerr(err: Error) -> PyErr {
+    match err {
+        Error::MissingField("document_url" | "image_url") => {
+            PyValueError::new_err("Document URL is required")
+        }
+        Error::Http { status, body } => RustUpstreamError::new_err((status, body)),
+        other => core_error_to_pyerr(other),
+    }
+}
+
 /// Map a core error for a route whose host keeps a Python implementation.
 ///
 /// The distinction the host needs is whether the provider was already called.
@@ -245,7 +255,7 @@ fn ocr(
 
     match result {
         Ok(value) => to_py(py, &value),
-        Err(err) => Err(core_error_to_pyerr(err)),
+        Err(err) => Err(ocr_error_to_pyerr(err)),
     }
 }
 
@@ -287,7 +297,7 @@ fn aocr(
             litellm_call_id: None,
         })
         .await
-        .map_err(core_error_to_pyerr)?;
+        .map_err(ocr_error_to_pyerr)?;
 
         Python::attach(|py| to_py(py, &value))
     })
@@ -627,4 +637,32 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "panic-test")]
     module.add_function(wrap_pyfunction!(_panic_for_test, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod ocr_error_tests {
+    use super::*;
+
+    #[test]
+    fn ocr_errors_preserve_python_validation_and_provider_details() {
+        Python::initialize();
+        Python::attach(|py| {
+            for field in ["document_url", "image_url"] {
+                let mapped = ocr_error_to_pyerr(Error::MissingField(field));
+                assert!(mapped.is_instance_of::<PyValueError>(py));
+                assert_eq!(mapped.value(py).to_string(), "Document URL is required");
+            }
+            let mapped = ocr_error_to_pyerr(Error::Http {
+                status: 429,
+                body: r#"{"message":"rate limited"}"#.to_string(),
+            });
+            assert!(mapped.is_instance_of::<RustUpstreamError>(py));
+            let args: (u16, String) = mapped
+                .value(py)
+                .getattr("args")
+                .and_then(|args| args.extract())
+                .expect("OCR failures retain status and unprefixed provider message");
+            assert_eq!(args, (429, r#"{"message":"rate limited"}"#.to_string()));
+        });
+    }
 }
