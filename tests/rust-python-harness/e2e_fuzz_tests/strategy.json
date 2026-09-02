@@ -9,7 +9,7 @@
       "selectors": [
         "tests/rust-python-harness/e2e_fuzz_tests/ocr/test_sdk_parity.py"
       ],
-      "note": "Recorded sync/async SDK parity; Reducto lacks a Rust contract and remains expected to fail."
+      "note": "Recorded sync/async SDK parity; invalid-model provider errors differ, and Reducto lacks a Rust contract."
     },
     "messages": {
       "coverage": "partial",

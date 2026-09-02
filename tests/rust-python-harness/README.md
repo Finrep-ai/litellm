@@ -108,7 +108,7 @@ their LOC thresholds. Generated Rust LCOV/HTML and the combined index also belon
 | `n/a` | Strategy does not apply to this SDK function |
 | `◐` | The configured tests cover only part of the TDD's parity contract |
 
-OCR runs committed provider recordings through both SDK implementations. Its bridge checks live under `validate_sub_methods/ocr/`. OCR remains partial because Reducto lacks a Rust contract. Messages and Responses retain their partial bridge coverage, and unimplemented cells remain planned
+OCR runs committed provider recordings through both SDK implementations. Its strategy manifest references the existing bridge checks in `tests/test_litellm/ocr/`. OCR remains partial: invalid-model provider errors differ between Python and Rust, and Reducto lacks a Rust contract. Messages and Responses retain their partial bridge coverage, and unimplemented cells remain planned
 
 ## Attach parity tests
 
@@ -146,7 +146,7 @@ The harness is driven from Python, matching the SDK surface and existing test to
 
 ## OCR fixtures and harness checks
 
-`parity/` owns shared recording, replay, comparison, streaming, media generation, and cassette persistence. `e2e_fuzz_tests/ocr/` owns OCR input strategies, provider configuration, fixture generation, committed cassettes, and SDK parity tests. `validate_sub_methods/ocr/` owns focused OCR bridge tests
+`parity/` owns shared recording, replay, comparison, streaming, media generation, and cassette persistence. `e2e_fuzz_tests/ocr/` owns OCR input strategies, provider configuration, fixture generation, committed cassettes, and SDK parity tests. `validate_sub_methods/strategy.json` selects the existing OCR bridge tests without moving or changing them
 
 Run recorded OCR parity without provider credentials:
 
@@ -170,4 +170,4 @@ uv run pytest tests/rust-python-harness tests/test_rust_python_harness.py -q
 
 Pytest enables namespace-package discovery in `pyproject.toml` so the existing hyphenated harness directory supports relative imports. Subprocess parity workers use the same package through `python -m`
 
-The small `tests/provider_record_replay/http.py` header helper stays shared with the proxy E2E recorder; all SDK parity machinery and OCR fixture assets live here
+HTTP recording helpers live in `parity/http.py`. The harness does not change the proxy E2E recorder or Python production code. SDK parity failures expose differences in the implementations under test

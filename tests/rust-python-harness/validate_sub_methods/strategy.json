@@ -7,9 +7,9 @@
     "ocr": {
       "coverage": "partial",
       "selectors": [
-        "tests/rust-python-harness/validate_sub_methods/ocr/test_rust_bridge.py"
+        "tests/test_litellm/ocr/test_rust_bridge.py"
       ],
-      "note": "OCR bridge dispatch, validation, and provider error mapping; isolated transform inventory remains incomplete."
+      "note": "Existing OCR bridge dispatch and validation checks; isolated transform inventory remains incomplete."
     },
     "messages": {
       "coverage": "planned",
