@@ -1,4 +1,4 @@
-name: Publish Finrep image
+name: Publish Finrep Artifact Registry image
 
 on:
   push:
@@ -6,6 +6,13 @@ on:
       - "v*-finrep.*"
 
 permissions: {}
+
+env:
+  GCP_ARTIFACT_REGISTRY_HOST: ${{ vars.GCP_ARTIFACT_REGISTRY_HOST }}
+  GCP_IMAGE: ${{ vars.GCP_ARTIFACT_REGISTRY_IMAGE }}
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+  GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
 
 concurrency:
   group: publish-finrep-image-${{ github.ref }}
@@ -21,15 +28,22 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-      packages: write
     steps:
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
+      - id: gcp-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ env.GCP_ARTIFACT_REGISTRY_HOST }}
+          username: oauth2accesstoken
+          password: ${{ steps.gcp-auth.outputs.access_token }}
 
       - id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -38,7 +52,7 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/finrep-ai/litellm:${{ github.ref_name }}
+          tags: ${{ env.GCP_IMAGE }}:${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
@@ -46,6 +60,6 @@ jobs:
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ghcr.io/finrep-ai/litellm
+          subject-name: ${{ env.GCP_IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
