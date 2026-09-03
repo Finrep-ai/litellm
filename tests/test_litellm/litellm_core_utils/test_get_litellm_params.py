@@ -8,6 +8,7 @@ import pytest
 
 from litellm.litellm_core_utils.get_litellm_params import (
     _OPTIONAL_KWARGS_KEYS,
+    FORWARDED_KWARGS_KEYS,
     _get_base_model_from_litellm_call_metadata,
     get_litellm_params,
 )
@@ -244,3 +245,23 @@ class TestRustOptIn:
         from litellm.types.utils import all_litellm_params
 
         assert "rust" in all_litellm_params
+
+
+class TestAnthropicCustomBaseBearerAuth:
+    def test_bearer_auth_is_forwarded_from_completion_kwargs(self):
+        assert "use_bearer_for_custom_base" in FORWARDED_KWARGS_KEYS
+
+    def test_bearer_auth_survives_into_litellm_params(self):
+        params = get_litellm_params(use_bearer_for_custom_base=True)
+        assert params["use_bearer_for_custom_base"] is True
+
+    def test_bearer_auth_is_absent_when_not_configured(self):
+        assert "use_bearer_for_custom_base" not in get_litellm_params()
+
+    def test_bearer_auth_stays_out_of_the_provider_body(self):
+        from litellm.utils import filter_out_litellm_params
+
+        params = filter_out_litellm_params(
+            {"use_bearer_for_custom_base": True, "provider_param": "value"}
+        )
+        assert params == {"provider_param": "value"}
