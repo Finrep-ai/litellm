@@ -70,13 +70,14 @@ def _manifest() -> dict[str, object]:
     }
 
 
-def test_should_load_the_three_harness_strategies_in_order() -> None:
+def test_should_load_the_four_harness_strategies_in_order() -> None:
     strategies = load_catalog()
 
     assert [strategy.id for strategy in strategies] == [
         "e2e_parity",
         "trace_parity",
         "unit_tests",
+        "existing_e2e_test_sdk",
     ]
     assert all(
         tuple(case.sdk_function for case in strategy.cases) == SDK_FUNCTIONS
@@ -108,6 +109,8 @@ def test_should_reject_a_manifest_missing_an_sdk_function(tmp_path: Path) -> Non
             True,
         ),
         ("tests/test_parity.py::test_one", "tests/test_parity.py::test_two", False),
+        ("tests/ocr_tests/", "tests/ocr_tests/test_ocr_mistral.py::test_one", True),
+        ("tests/ocr_tests/", "tests/other_tests/test_ocr_mistral.py::test_one", False),
     ],
 )
 def test_should_match_pytest_file_and_node_selectors(
@@ -125,6 +128,13 @@ def test_should_only_return_selectors_whose_files_exist(tmp_path: Path) -> None:
     )
 
     assert runnable_selectors((case,), tmp_path) == ("tests/test_parity.py",)
+
+
+def test_should_treat_an_existing_folder_selector_as_runnable(tmp_path: Path) -> None:
+    (tmp_path / "tests" / "ocr_tests").mkdir(parents=True)
+    case = _case(selectors=("tests/ocr_tests/",))
+
+    assert runnable_selectors((case,), tmp_path) == ("tests/ocr_tests/",)
 
 
 def test_should_mark_planned_and_not_applicable_cases_without_running() -> None:
@@ -149,7 +159,8 @@ def test_should_treat_an_all_planned_filtered_run_as_success(tmp_path: Path) -> 
     assert next(iter(run.results.values())).status is RunStatus.PLANNED
 
 
-def test_should_run_namespace_package_relative_imports(tmp_path: Path) -> None:
+@pytest.mark.parametrize("strategy_id", ("e2e_parity", "existing_e2e_test_sdk"))
+def test_should_run_namespace_package_relative_imports(tmp_path: Path, strategy_id: str) -> None:
     package: Final = tmp_path / "manual_suite" / "relative-tests"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
@@ -164,12 +175,12 @@ def test_should_run_namespace_package_relative_imports(tmp_path: Path) -> None:
             "-c",
             "import importlib\n"
             "from pathlib import Path\n"
-            "runner = importlib.import_module('tests.rust-python-harness.shared.reporting.pytest_runner')\n"
+            "cli = importlib.import_module('tests.rust-python-harness.cli')\n"
             "models = importlib.import_module('tests.rust-python-harness.shared.reporting.models')\n"
-            "case = runner.HarnessCase(strategy_id='example', strategy_label='Example', "
+            f"case = models.HarnessCase(strategy_id={strategy_id!r}, strategy_label='Example', "
             "sdk_function='ocr', coverage=models.Coverage.COMPLETE, "
-            "selectors=('manual_suite/relative-tests/test_relative.py',))\n"
-            "code, run = runner.run_pytest((case,), Path.cwd(), lambda _: None)\n"
+            "selectors=('manual_suite/relative-tests/',))\n"
+            f"code, run = cli._resolve_runner({strategy_id!r})((case,), Path.cwd(), lambda _: None)\n"
             "assert code == 0, code\n"
             "assert next(iter(run.results.values())).passed == 1\n",
         ),
@@ -282,8 +293,8 @@ def test_should_report_confidence_for_each_sdk_section() -> None:
     }
 
     assert scores["responses"].verified_strategies == 1
-    assert scores["responses"].required_strategies == 3
-    assert scores["responses"].percentage == 33
+    assert scores["responses"].required_strategies == 4
+    assert scores["responses"].percentage == 25
     assert scores["responses"].level.value == "MEDIUM"
     assert scores["count_tokens"].percentage == 0
     assert scores["count_tokens"].level.value == "LOW"
@@ -320,7 +331,7 @@ def test_should_scope_validate_ledger_to_the_requested_function(
     assert "ocr" not in captured.out
 
 
-@pytest.mark.parametrize("strategy_id", (None, "e2e_parity", "trace_parity", "unit_tests"))
+@pytest.mark.parametrize("strategy_id", (None, "e2e_parity", "trace_parity", "unit_tests", "existing_e2e_test_sdk"))
 def test_should_validate_chat_completions_ledger_from_each_runner(
     strategy_id: str | None, capsys: pytest.CaptureFixture[str]
 ) -> None:

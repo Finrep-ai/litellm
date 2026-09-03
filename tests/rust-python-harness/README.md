@@ -10,6 +10,7 @@ strategies/
     sdk/chat_completions/
     sdk/responses/
     gateway/
+  existing_e2e_test_sdk/runner.py
   trace_parity/runner.py
     sdk/
     gateway/
@@ -33,6 +34,7 @@ uv run python -m tests.rust-python-harness --strategy e2e_parity --surface sdk -
 uv run python -m tests.rust-python-harness.strategies.e2e_parity.runner --function ocr --plain
 uv run python -m tests.rust-python-harness.strategies.trace_parity.runner --plain
 uv run python -m tests.rust-python-harness.strategies.unit_tests.runner --plain
+uv run python -m tests.rust-python-harness.strategies.existing_e2e_test_sdk.runner --function transcription --plain
 ```
 
 Use `--interactive` for strategy and function selection, `--pytest-arg=-x` to stop pytest on its first failure, and `--coverage` to write Python coverage under `target/rust-python-harness/`. The harness enables pytest namespace-package discovery only for its own invocations
@@ -47,9 +49,11 @@ Trace parity compares operation names through an explicit Python/Rust mapping, c
 
 Unit testing combines test mapping validation, separate Python processes with Rust disabled and enabled, backend verification, result comparison, and native Cargo tests. Native tests stay beside their Rust implementation. Existing Python tests stay at their original paths. No complete Python/native unit mapping is configured yet, so these cells remain planned
 
+The existing E2E SDK strategy retains the live provider tests configured upstream. It runs OCR, Chat Completions, and Transcription checks from their existing paths and reports them separately from parity tests. These tests require provider credentials
+
 ## Configure cases
 
-Each strategy has a `strategy.json`. Its `functions` object defines SDK cases for OCR, Messages, Chat Completions, Responses, and Count Tokens. E2E and trace manifests also accept a `gateway` object keyed by API name. A case has `coverage`, `selectors`, and an optional `note`
+Each strategy has a `strategy.json`. Its `functions` object defines SDK cases for OCR, Messages, Responses, Count Tokens, Chat Completions, and Transcription. E2E and trace manifests also accept a `gateway` object keyed by API name. A case has `coverage`, `selectors`, and an optional `note`
 
 ```json
 {
@@ -57,6 +61,8 @@ Each strategy has a `strategy.json`. Its `functions` object defines SDK cases fo
   "selectors": ["tests/rust-python-harness/strategies/e2e_parity/sdk/ocr/test_sdk_parity.py"]
 }
 ```
+
+Selectors use pytest file or node syntax. A selector ending in `/` includes tests recursively from that directory
 
 Use `planned` with no selectors until an executable contract exists, `partial` for incomplete coverage, `complete` for the full contract, and `not_applicable` when a strategy does not apply. The dashboard shows passing evidence separately from coverage completeness and LOC coverage
 
