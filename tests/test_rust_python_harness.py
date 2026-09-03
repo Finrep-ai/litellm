@@ -12,9 +12,9 @@ import pytest
 
 catalog = importlib.import_module("tests.rust-python-harness.catalog")
 cli = importlib.import_module("tests.rust-python-harness.cli")
-models = importlib.import_module("tests.rust-python-harness.models")
-runner = importlib.import_module("tests.rust-python-harness.runner")
-ui = importlib.import_module("tests.rust-python-harness.ui")
+models = importlib.import_module("tests.rust-python-harness.shared.reporting.models")
+runner = importlib.import_module("tests.rust-python-harness.shared.reporting.pytest_runner")
+ui = importlib.import_module("tests.rust-python-harness.shared.reporting.ui")
 
 load_catalog = catalog.load_catalog
 _pick_values = cli._pick_values
@@ -64,9 +64,9 @@ def test_should_load_the_three_harness_strategies_in_order() -> None:
     strategies = load_catalog()
 
     assert [strategy.id for strategy in strategies] == [
-        "e2e_fuzz_tests",
-        "unit_tests_rust",
-        "validate_sub_methods",
+        "e2e_parity",
+        "trace_parity",
+        "unit_tests",
     ]
     assert all(
         tuple(case.sdk_function for case in strategy.cases) == SDK_FUNCTIONS
@@ -154,8 +154,8 @@ def test_should_run_namespace_package_relative_imports(tmp_path: Path) -> None:
             "-c",
             "import importlib\n"
             "from pathlib import Path\n"
-            "runner = importlib.import_module('tests.rust-python-harness.runner')\n"
-            "models = importlib.import_module('tests.rust-python-harness.models')\n"
+            "runner = importlib.import_module('tests.rust-python-harness.shared.reporting.pytest_runner')\n"
+            "models = importlib.import_module('tests.rust-python-harness.shared.reporting.models')\n"
             "case = runner.HarnessCase(strategy_id='example', strategy_label='Example', "
             "sdk_function='ocr', coverage=models.Coverage.COMPLETE, "
             "selectors=('manual_suite/relative-tests/test_relative.py',))\n"
@@ -207,10 +207,10 @@ def test_should_replace_a_pass_with_a_teardown_error() -> None:
 def test_should_filter_the_catalog_by_strategy_and_sdk_function() -> None:
     strategies = load_catalog()
 
-    cases = _select(strategies, {"e2e_fuzz_tests"}, {"messages"})
+    cases = _select(strategies, {"e2e_parity"}, {"messages"})
 
     assert len(cases) == 1
-    assert cases[0].key == "e2e_fuzz_tests:messages"
+    assert cases[0].key == "e2e_parity:messages"
 
 
 def test_should_reject_an_unknown_strategy() -> None:
@@ -263,7 +263,7 @@ def test_should_report_confidence_for_each_sdk_section() -> None:
     strategies = load_catalog()
     cases = tuple(case for strategy in strategies for case in strategy.cases)
     run = HarnessRun.from_cases(cases)
-    passing = run.results["e2e_fuzz_tests:responses"]
+    passing = run.results["e2e_parity:responses"]
     passing.collected.add("tests/test_parity.py::test_one")
     passing.record("tests/test_parity.py::test_one", RunStatus.PASSED)
 
