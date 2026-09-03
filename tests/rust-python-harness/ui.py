@@ -52,7 +52,7 @@ def _format_duration(seconds: float) -> str:
 
 
 def _rerun_command(nodeid: str) -> str:
-    return f"poetry run pytest {shlex.quote(nodeid)} -q"
+    return f"poetry run pytest {shlex.quote(nodeid)} -q -o consider_namespace_packages=true"
 
 
 def _summary(run: HarnessRun) -> tuple[int, int, int, int]:

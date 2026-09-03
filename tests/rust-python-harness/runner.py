@@ -4,6 +4,7 @@ import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from time import monotonic
+from typing import Final
 
 import pytest
 
@@ -146,11 +147,11 @@ def run_pytest(
         return exit_code, run
 
     plugin = HarnessPytestPlugin(run=run, on_update=on_update)
-    args = [*selectors, "-p", "no:terminal", *pytest_args]
+    args: Final = (*selectors, "-p", "no:terminal", "-o", "consider_namespace_packages=true", *pytest_args)
     previous_directory = Path.cwd()
     try:
         os.chdir(repo_root)
-        exit_code = int(pytest.main(args, plugins=[plugin]))
+        exit_code = int(pytest.main(list(args), plugins=[plugin]))
     finally:
         os.chdir(previous_directory)
     if exit_code == 0 and any(

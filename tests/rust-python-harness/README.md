@@ -167,9 +167,9 @@ See [OCR fixture setup](e2e_fuzz_tests/ocr/fixtures/README.md) for provider cred
 Run the shared machinery and OCR fixture-generation checks alongside parity:
 
 ```bash
-uv run pytest tests/rust-python-harness tests/test_rust_python_harness.py -q
+uv run pytest -o consider_namespace_packages=true tests/rust-python-harness tests/test_rust_python_harness.py -q
 ```
 
-Pytest enables namespace-package discovery in `pyproject.toml` so the existing hyphenated harness directory supports relative imports. Subprocess parity workers use the same package through `python -m`
+The harness is manual-only and is listed in `.github/ci-coverage-allowlist.yml`. Its CLI enables pytest namespace-package discovery for that invocation so the hyphenated harness directory supports relative imports. Other test runs keep the repository's default import behavior. Subprocess parity workers use the same package through `python -m`
 
 HTTP recording helpers live in `parity/http.py`. The harness does not change the proxy E2E recorder or Python production code. SDK parity failures expose differences in the implementations under test

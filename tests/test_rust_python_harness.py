@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
+from typing import Final
 
 import pytest
 
@@ -135,6 +139,45 @@ def test_should_treat_an_all_planned_filtered_run_as_success(tmp_path: Path) -> 
     assert next(iter(run.results.values())).status is RunStatus.PLANNED
 
 
+def test_should_run_namespace_package_relative_imports(tmp_path: Path) -> None:
+    package: Final = tmp_path / "manual_suite" / "relative-tests"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "values.py").write_text("ANSWER = 42\n", encoding="utf-8")
+    (package / "test_relative.py").write_text(
+        "from .values import ANSWER\n\ndef test_answer():\n    assert ANSWER == 42\n",
+        encoding="utf-8",
+    )
+    result: Final = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "import importlib\n"
+            "from pathlib import Path\n"
+            "runner = importlib.import_module('tests.rust-python-harness.runner')\n"
+            "models = importlib.import_module('tests.rust-python-harness.models')\n"
+            "case = runner.HarnessCase(strategy_id='example', strategy_label='Example', "
+            "sdk_function='ocr', coverage=models.Coverage.COMPLETE, "
+            "selectors=('manual_suite/relative-tests/test_relative.py',))\n"
+            "code, run = runner.run_pytest((case,), Path.cwd(), lambda _: None)\n"
+            "assert code == 0, code\n"
+            "assert next(iter(run.results.values())).passed == 1\n",
+        ),
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join((str(tmp_path), str(Path(__file__).resolve().parents[1]))),
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_should_finalize_a_fully_passing_case() -> None:
     result = CaseResult(case=_case(selectors=("tests/test_parity.py",)))
     result.set_initial_status()
@@ -196,10 +239,10 @@ def test_should_format_developer_facing_run_context() -> None:
     assert _summary(run) == (1, 0, 0, 0)
     assert _format_duration(1.25) == "1.2s"
     assert _rerun_command("tests/test_parity.py::test_one") == (
-        "poetry run pytest tests/test_parity.py::test_one -q"
+        "poetry run pytest tests/test_parity.py::test_one -q -o consider_namespace_packages=true"
     )
     assert _rerun_command("tests/test_parity.py::test_one[value with spaces]") == (
-        "poetry run pytest 'tests/test_parity.py::test_one[value with spaces]' -q"
+        "poetry run pytest 'tests/test_parity.py::test_one[value with spaces]' -q -o consider_namespace_packages=true"
     )
 
 
