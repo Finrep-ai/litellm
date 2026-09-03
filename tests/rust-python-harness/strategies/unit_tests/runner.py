@@ -39,6 +39,7 @@ def run_suite(suite: UnitSuite, repo_root: Path, pytest_args: Sequence[str] = ()
     return (
         *compare_python_runs(python, rust_python),
         *mapping.problems,
+        *(("native Rust tests did not all pass",) if set(inventory.tests) != set(rust.tests) else ()),
         *((inventory.output,) if inventory.exit_code else ()),
         *((rust.output,) if rust.exit_code else ()),
     )

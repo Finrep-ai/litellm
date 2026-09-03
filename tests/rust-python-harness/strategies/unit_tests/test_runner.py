@@ -51,3 +51,9 @@ def test_combines_mapping_backend_comparison_and_cargo_results(tmp_path: Path, m
     assert failed_code == 1
     assert failed_report.results[case.key].status is RunStatus.FAILED
     assert any("missing Rust counterpart: removed" in detail for _, detail in failed_report.failures)
+
+    (tmp_path / "suite.json").write_text(json.dumps(suite))
+    (tmp_path / "src/lib.rs").write_text("#[test] #[ignore] fn test_decode() {}\n")
+    skipped_code, skipped_report = run((case,), tmp_path, lambda _: None)
+    assert skipped_code == 1
+    assert any("native Rust tests did not all pass" in detail for _, detail in skipped_report.failures)
