@@ -6,9 +6,12 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .catalog import load_catalog
-from .models import HarnessCase, Strategy
-from .runner import run_pytest
-from .ui import make_dashboard
+from .shared.reporting.models import HarnessCase, Strategy
+from .shared.reporting.orchestration import StrategyRunner, run_strategies
+from .shared.reporting.ui import make_dashboard
+from .strategies.e2e_parity.runner import run as run_e2e
+from .strategies.trace_parity.runner import run as run_trace
+from .strategies.unit_tests.runner import run as run_units
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COVERAGE_ROOT = REPO_ROOT / "target" / "rust-python-harness"
@@ -40,9 +43,10 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         dest="sdk_functions",
-        choices=("ocr", "messages", "responses", "count_tokens"),
+        choices=("ocr", "messages", "chat_completions", "responses", "count_tokens"),
         help="run only this SDK function",
     )
+    parser.add_argument("--surface", choices=("sdk", "gateway"), help="run only this API surface")
     parser.add_argument(
         "--plain",
         action="store_true",
@@ -100,7 +104,7 @@ def _interactive_filters(strategies: Sequence[Strategy]) -> tuple[set[str], set[
     )
     sdk_functions = _pick_values(
         "SDK functions",
-        [(name, name) for name in ("ocr", "messages", "responses", "count_tokens")],
+        [(name, name) for name in ("ocr", "messages", "chat_completions", "responses", "count_tokens")],
     )
     return strategy_ids, sdk_functions
 
@@ -126,19 +130,32 @@ def _print_catalog(strategies: Sequence[Strategy]) -> None:
         print(f"{strategy.id:20} {strategy.label}")
         for case in strategy.cases:
             selectors = (
-                ", ".join(case.selectors) if case.selectors else "no test configured"
+                ", ".join(case.selectors) if case.selectors else case.unit_suite or "no test configured"
             )
-            print(f"  {case.sdk_function:12} {case.coverage.value:14} {selectors}")
+            print(f"  {case.surface}/{case.sdk_function:12} {case.coverage.value:14} {selectors}")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _resolve_runner(strategy_id: str) -> StrategyRunner:
+    match strategy_id:
+        case "e2e_parity":
+            return run_e2e
+        case "trace_parity":
+            return run_trace
+        case "unit_tests":
+            return run_units
+        case _:
+            raise ValueError(f"Unknown strategy: {strategy_id}")
+
+
+def main(argv: Sequence[str] | None = None, *, strategy_id: str | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.coverage and importlib.util.find_spec("pytest_cov") is None:
         _parser().error(
             "--coverage requires the project's pytest-cov dependency; run with "
             "`poetry run python -m tests.rust-python-harness --coverage`"
         )
-    strategies = load_catalog()
+    catalog = load_catalog()
+    strategies = tuple(strategy for strategy in catalog if strategy_id is None or strategy.id == strategy_id)
     if args.list:
         _print_catalog(strategies)
         return 0
@@ -151,7 +168,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         sdk_functions = sdk_functions or picked_functions
 
     try:
-        cases = _select(strategies, strategy_ids, sdk_functions)
+        selected = _select(strategies, strategy_ids, sdk_functions)
+        cases = tuple(case for case in selected if args.surface is None or case.surface == args.surface)
     except ValueError as exc:
         _parser().error(str(exc))
     selected_strategy_ids = {case.strategy_id for case in cases}
@@ -167,11 +185,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.coverage:
         pytest_args.extend(_coverage_pytest_args())
     with dashboard:
-        exit_code, run = run_pytest(
+        exit_code, run = run_strategies(
             cases=cases,
             repo_root=REPO_ROOT,
             on_update=dashboard.update,
             pytest_args=pytest_args,
+            resolve_runner=_resolve_runner,
         )
         dashboard.finish(run, exit_code)
     if args.coverage and (COVERAGE_ROOT / "python.json").exists():
