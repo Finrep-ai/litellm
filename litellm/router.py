@@ -21,7 +21,7 @@ import time
 import traceback
 import weakref
 from collections import defaultdict
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Iterator, Mapping, Sequence
 from functools import lru_cache, partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, TypeAlias, TypeVar, Union, cast
@@ -116,6 +116,9 @@ from litellm.router_utils.add_retry_fallback_headers import (
 from litellm.router_utils.auto_router_model_naming import (
     AUTO_ROUTER_MODEL_PREFIX,
     classify_strategy_router_model,
+    count_heuristic_v2_routers,
+    heuristic_v2_limit_violation,
+    uses_heuristic_v2_classifier,
 )
 from litellm.router_utils.batch_utils import (
     _get_router_metadata_variable_name,
@@ -210,6 +213,7 @@ from litellm.types.router import (
     DeploymentTypedDict,
     FallbackAccessCheck,
     GuardrailTypedDict,
+    HeuristicV2RouterLimit,
     LiteLLM_Params,
     MockRouterTestingParams,
     ModelGroupInfo,
@@ -681,6 +685,7 @@ class Router:
         background_health_check_model_groups: Sequence[str] | None = None,
         enable_weighted_failover: bool = False,
         fallback_access_check: FallbackAccessCheck | None = None,
+        heuristic_v2_router_limit: HeuristicV2RouterLimit | None = None,
     ) -> None:
         """
         Initialize the Router class with the given parameters for caching, reliability, and routing strategy.
@@ -757,6 +762,7 @@ class Router:
 
         self.set_verbose = set_verbose
         self.ignore_invalid_deployments = ignore_invalid_deployments
+        self.heuristic_v2_router_limit = heuristic_v2_router_limit
         self.fallback_access_check: Final = fallback_access_check
         self.debug_level = debug_level
         self.enable_pre_call_checks = enable_pre_call_checks
@@ -8710,6 +8716,31 @@ class Router:
         """
         return classify_strategy_router_model(litellm_params.model) == "complexity"
 
+    def config_deployments(self) -> Iterator[Mapping[str, object]]:
+        """The model_list rows that came from config.yaml rather than the DB (``model_info.db_model`` unset)."""
+        for deployment in self.model_list:
+            if not isinstance(deployment, Mapping):
+                continue
+            model_info = deployment.get("model_info")
+            if not (isinstance(model_info, Mapping) and model_info.get("db_model")):
+                yield deployment
+
+    def heuristic_v2_router_limit_violation(self, *, exclude_model_id: str | None = None) -> str | None:
+        """
+        Why one more heuristic_v2 router cannot join this router, or None when it can.
+
+        Judged against every deployment currently on the model_list except ``exclude_model_id``,
+        so an edit of an existing heuristic_v2 router keeps its own slot. The limit is resolved on
+        every call through ``heuristic_v2_router_limit``; unset means unlimited, which is the SDK
+        default, and the proxy injects a resolver backed by its license.
+        """
+        limit: Final = self.heuristic_v2_router_limit() if self.heuristic_v2_router_limit is not None else None
+        others: Final = count_heuristic_v2_routers(
+            (deployment for deployment in self.model_list if isinstance(deployment, Mapping)),
+            exclude_model_id=exclude_model_id,
+        )
+        return heuristic_v2_limit_violation(held=others + 1, limit=limit)
+
     def init_complexity_router_deployment(self, deployment: Deployment):
         """
         Initialize the complexity-router deployment.
@@ -8727,6 +8758,10 @@ class Router:
         )
 
         complexity_router_config: Final[dict | None] = deployment.litellm_params.complexity_router_config
+        if uses_heuristic_v2_classifier(complexity_router_config):
+            limit_violation: Final = self.heuristic_v2_router_limit_violation()
+            if limit_violation is not None:
+                raise ValueError(limit_violation)
 
         default_model: str | None = deployment.litellm_params.complexity_router_default_model
 
@@ -9500,6 +9535,15 @@ class Router:
                 ):
                     # No need to update
                     return None
+
+                if self._is_complexity_router_deployment(
+                    litellm_params=deployment.litellm_params
+                ) and uses_heuristic_v2_classifier(deployment.litellm_params.complexity_router_config):
+                    slot_violation: Final = self.heuristic_v2_router_limit_violation(
+                        exclude_model_id=_deployment_model_id
+                    )
+                    if slot_violation is not None:
+                        raise ValueError(slot_violation)
 
                 # if there is a new litellm param -> then update the deployment
                 # remove the previous deployment
