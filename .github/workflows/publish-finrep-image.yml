@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
+      artifact-metadata: write
       attestations: write
       contents: read
       id-token: write
