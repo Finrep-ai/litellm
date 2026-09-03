@@ -23,6 +23,10 @@
     "count_tokens": {
       "coverage": "planned",
       "selectors": []
+    },
+    "transcription": {
+      "coverage": "planned",
+      "selectors": []
     }
   },
   "gateway": {}

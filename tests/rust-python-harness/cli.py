@@ -6,17 +6,17 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .catalog import load_catalog
-from .shared.reporting.models import HarnessCase, Strategy
+from .shared.reporting.models import SDK_FUNCTIONS, HarnessCase, Strategy
 from .shared.reporting.orchestration import StrategyRunner, run_strategies
 from .shared.reporting.ui import make_dashboard
 from .strategies.e2e_parity.runner import run as run_e2e
+from .strategies.existing_e2e_test_sdk.runner import run as run_existing
 from .strategies.trace_parity.runner import run as run_trace
 from .strategies.unit_tests.mapping_validator import FunctionReport, build_function_report
 from .strategies.unit_tests.runner import run as run_units
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COVERAGE_ROOT = REPO_ROOT / "target" / "rust-python-harness"
-SDK_FUNCTION_CHOICES = ("ocr", "messages", "chat_completions", "responses", "count_tokens")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -45,7 +45,7 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         dest="sdk_functions",
-        choices=SDK_FUNCTION_CHOICES,
+        choices=SDK_FUNCTIONS,
         help="run only this SDK function",
     )
     parser.add_argument("--surface", choices=("sdk", "gateway"), help="run only this API surface")
@@ -114,7 +114,7 @@ def _interactive_filters(strategies: Sequence[Strategy]) -> tuple[set[str], set[
     )
     sdk_functions = _pick_values(
         "SDK functions",
-        [(name, name) for name in SDK_FUNCTION_CHOICES],
+        [(name, name) for name in SDK_FUNCTIONS],
     )
     return strategy_ids, sdk_functions
 
@@ -170,7 +170,7 @@ def _print_function_report(report: FunctionReport) -> None:
 
 
 def _validate_ledger(sdk_functions: set[str]) -> int:
-    functions = sdk_functions or set(SDK_FUNCTION_CHOICES)
+    functions = sdk_functions or set(SDK_FUNCTIONS)
     reports = tuple(build_function_report(function) for function in sorted(functions))
     for report in reports:
         _print_function_report(report)
@@ -185,6 +185,8 @@ def _resolve_runner(strategy_id: str) -> StrategyRunner:
             return run_trace
         case "unit_tests":
             return run_units
+        case "existing_e2e_test_sdk":
+            return run_existing
         case _:
             raise ValueError(f"Unknown strategy: {strategy_id}")
 
