@@ -147,7 +147,7 @@ def run_pytest(
         return exit_code, run
 
     plugin = HarnessPytestPlugin(run=run, on_update=on_update)
-    args: Final = (*selectors, "-p", "no:terminal", "-o", "consider_namespace_packages=true", *pytest_args)
+    args: Final = (*selectors, "-q", "--tb=no", "--no-summary", "-o", "consider_namespace_packages=true", *pytest_args)
     previous_directory = Path.cwd()
     try:
         os.chdir(repo_root)

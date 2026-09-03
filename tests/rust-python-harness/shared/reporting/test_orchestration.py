@@ -9,7 +9,7 @@ from .pytest_runner import run_pytest
 
 
 def test_combines_independent_strategy_reports_and_keeps_failures(tmp_path: Path) -> None:
-    (tmp_path / "test_first.py").write_text("def test_first():\n    assert False\n")
+    (tmp_path / "test_first.py").write_text("def test_first():\n    assert 1 == 2\n")
     (tmp_path / "test_second.py").write_text("def test_second():\n    assert True\n")
     cases: Final = tuple(
         HarnessCase(
@@ -27,6 +27,8 @@ def test_combines_independent_strategy_reports_and_keeps_failures(tmp_path: Path
     assert report.results["second:ocr"].status is RunStatus.PASSED
     assert report.completed_tests == 2
     assert len(report.failures) == 1
+    assert "assert 1 == 2" in report.failures[0][1]
+    assert "terminalreporter" not in report.failures[0][1]
 
 
 def test_missing_selector_cannot_hide_behind_a_passing_surface(tmp_path: Path) -> None:
