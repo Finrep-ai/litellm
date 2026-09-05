@@ -54,6 +54,8 @@ GPT5_MODELS = [
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
+    "gpt-6",
+    "gpt-6-astra",  # the only gpt-6 id OpenAI serves today
     "gpt-5.1-chat",  # versioned chat — THE KEY REGRESSION CASE
     "gpt-5.2-chat",  # versioned chat — also a regression case
     "gpt-5.3-chat",  # versioned chat — THE KEY REGRESSION CASE
@@ -128,6 +130,8 @@ GPT5_4_PLUS_MODELS = [
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "openai/gpt-5.6-sol",
+    "gpt-6-astra",
+    "openai/gpt-6-astra",
 ]
 
 GPT5_PRE_5_4_MODELS = [
@@ -196,3 +200,82 @@ class TestAzureOpenAIGPT5ConfigIsModelGpt5Model:
             assert AzureOpenAIGPT5Config.is_model_gpt_5_model(
                 model
             ), f"Azure '{model}' with gpt5_series/ prefix should be classified as GPT-5"
+
+
+# ---------------------------------------------------------------------------
+# gpt-6
+# ---------------------------------------------------------------------------
+
+
+class TestGpt6IsHandledAsTheReasoningFamily:
+    """gpt-6 must inherit the gpt-5 request handling, not the plain chat path.
+
+    The classification above is not the point in itself — these are the two
+    request-shaping decisions that hang off it, and they are what a caller
+    actually hits. OpenAI rejects `max_tokens` for gpt-6-astra outright
+    ("Unsupported parameter: 'max_tokens' is not supported with this model.
+    Use 'max_completion_tokens' instead."), and rejects any `temperature`
+    other than the default. Both verified against the live API on 5 Sep 2026.
+
+    Before gpt-6 was added to GPT_REASONING_SERIES_MARKERS these tests failed:
+    the name matched no marker, the model fell to the plain chat path, and
+    every caller passing max_tokens got a 400 from OpenAI.
+    """
+
+    def test_max_tokens_is_rewritten_to_max_completion_tokens(self):
+        """Go through get_optional_params, the path a real request takes.
+
+        Calling OpenAIGPT5Config().map_openai_params() directly would pass
+        even unpatched -- that class always rewrites. What broke is that
+        gpt-6 never reached it.
+        """
+        from litellm.utils import get_optional_params
+
+        params = get_optional_params(
+            model="gpt-6-astra", custom_llm_provider="openai", max_tokens=10
+        )
+        assert params["max_completion_tokens"] == 10
+        assert "max_tokens" not in params
+
+    def test_non_default_temperature_is_dropped(self):
+        """OpenAI 400s any temperature but the default, so it must not be sent."""
+        from litellm.utils import get_optional_params
+
+        params = get_optional_params(
+            model="gpt-6-astra",
+            custom_llm_provider="openai",
+            temperature=0.2,
+            drop_params=True,
+        )
+        assert "temperature" not in params
+
+    def test_gpt_5_chat_exclusion_does_not_leak_into_gpt_6(self):
+        """The gpt-5-chat carve-out is keyed on a gpt-5 prefix only."""
+        assert OpenAIGPT5Config.is_model_gpt_5_model("gpt-6-chat")
+
+
+class TestGpt6AstraIsPriced:
+    """A model missing from the cost map logs spend at $0 and nobody notices.
+
+    Read the bundled JSON rather than litellm.model_cost: with
+    LITELLM_LOCAL_MODEL_COST_MAP unset, litellm fetches the map over the
+    network at import and the assertions would pass on upstream's copy
+    while this file stayed empty. Our deployment sets that flag to True,
+    so the bundled file is the only thing it ever reads.
+    """
+
+    def test_gpt_6_astra_has_openai_pricing_and_context_window(self):
+        import json
+        from pathlib import Path
+
+        import litellm
+
+        bundled = (
+            Path(litellm.__file__).parent / "model_prices_and_context_window_backup.json"
+        )
+        spec = json.loads(bundled.read_text())["gpt-6-astra"]
+        assert spec["litellm_provider"] == "openai"
+        assert spec["input_cost_per_token"] == 1e-05
+        assert spec["output_cost_per_token"] == 5e-05
+        assert spec["max_input_tokens"] == 922000
+        assert spec["supports_reasoning"] is True
