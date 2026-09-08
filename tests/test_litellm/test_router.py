@@ -9904,6 +9904,7 @@ async def test_aanthropic_messages_with_streaming_fallbacks_wraps_streaming_iter
     ):
         out = await router._ageneric_api_call_with_fallbacks_streaming_attempt(
             original_generic_function=litellm.anthropic_messages,
+            call_type="anthropic_messages",
             model="primary",
             stream=True,
         )
@@ -10135,6 +10136,7 @@ async def test_aanthropic_messages_with_streaming_fallbacks_deep_copies_nested_m
         ):
             await router._ageneric_api_call_with_fallbacks_streaming_attempt(
                 original_generic_function=litellm.anthropic_messages,
+                call_type="anthropic_messages",
                 model="primary",
                 stream=True,
                 litellm_metadata=primary_metadata,
@@ -10169,6 +10171,7 @@ async def test_aanthropic_messages_with_streaming_fallbacks_deep_copies_metadata
         ):
             await router._ageneric_api_call_with_fallbacks_streaming_attempt(
                 original_generic_function=litellm.anthropic_messages,
+                call_type="anthropic_messages",
                 model="primary",
                 stream=True,
                 metadata=primary_metadata,
@@ -11642,7 +11645,9 @@ async def test_streaming_fallback_walks_configured_graph(
     await _assert_streaming_fallback_graph(surface, failure_mode, fallbacks, expected_calls, succeeds, max_fallbacks)
 
 
-async def _assert_streaming_fallback_graph(surface, failure_mode, fallbacks, expected_calls, succeeds, max_fallbacks):
+async def _assert_streaming_fallback_graph(
+    surface, failure_mode, fallbacks, expected_calls, succeeds, max_fallbacks, messages_function=None
+):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     calls: list[str] = []
@@ -11712,7 +11717,12 @@ async def _assert_streaming_fallback_graph(surface, failure_mode, fallbacks, exp
         async def consume():
             request = {"model": "tier", "messages": [{"role": "user", "content": "hi"}], "stream": True}
             if surface == "messages":
-                response = await router.aanthropic_messages(**request, max_tokens=16)
+                messages_call = (
+                    router.factory_function(messages_function, call_type="anthropic_messages")
+                    if messages_function is not None
+                    else router.aanthropic_messages
+                )
+                response = await messages_call(**request, max_tokens=16)
                 chunks = [chunk async for chunk in response]
                 return "".join(
                     json.loads(line[6:])["delta"]["text"]
@@ -11755,4 +11765,28 @@ async def test_responses_streaming_fallback_preserves_continuation_when_resuming
         expected_calls=["primary", "secondary", "tertiary"],
         succeeds=True,
         max_fallbacks=10,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fallbacks, expected_calls",
+    [
+        ([{"tier": ["success"]}], ["primary"]),
+        (
+            [{"tier": ["secondary", "success"]}, {"secondary": ["tertiary"]}],
+            ["primary", "secondary", "tertiary"],
+        ),
+    ],
+    ids=["single-hop", "resume-ancestors"],
+)
+async def test_messages_streaming_fallback_with_partial_provider(fallbacks, expected_calls):
+    await _assert_streaming_fallback_graph(
+        surface="messages",
+        failure_mode="lazy",
+        fallbacks=fallbacks,
+        expected_calls=expected_calls,
+        succeeds=True,
+        max_fallbacks=10,
+        messages_function=functools.partial(litellm.anthropic_messages),
     )

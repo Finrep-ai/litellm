@@ -4825,7 +4825,9 @@ class Router:
             ),
         )
 
-    async def _ageneric_api_call_with_fallbacks(self, model: str, original_function: Callable, **kwargs):
+    async def _ageneric_api_call_with_fallbacks(
+        self, model: str, original_function: Callable, *, call_type: str | None = None, **kwargs
+    ):
         """
         Helper function to make a generic LLM API call through the router, this allows you to use retries/fallbacks with litellm router
         """
@@ -4833,7 +4835,7 @@ class Router:
             kwargs["model"] = model
             kwargs["original_generic_function"] = original_function
             kwargs["original_function"] = (
-                self._ageneric_api_call_with_fallbacks_streaming_attempt
+                partial(self._ageneric_api_call_with_fallbacks_streaming_attempt, call_type=call_type)
                 if kwargs.get("stream")
                 else self._ageneric_api_call_with_fallbacks_helper
             )
@@ -4889,6 +4891,8 @@ class Router:
         self,
         model: str,
         original_generic_function: Callable[..., Awaitable[object]],
+        *,
+        call_type: str | None = None,
         **kwargs: object,  # kwargs-ok: preserves the generic endpoint contract while wrapping its stream
     ) -> object:
         from litellm.litellm_core_utils.core_helpers import safe_deep_copy
@@ -4913,9 +4917,7 @@ class Router:
             return response
         if isinstance(response, BaseResponsesAPIStreamingIterator):
             return await self._aresponses_streaming_iterator(response=response, initial_kwargs=fallback_kwargs)
-        if getattr(original_generic_function, "__name__", None) == "anthropic_messages" and hasattr(
-            response, "__aiter__"
-        ):
+        if call_type == "anthropic_messages" and hasattr(response, "__aiter__"):
             return await self._aanthropic_messages_streaming_iterator(response=response, initial_kwargs=fallback_kwargs)
         return response
 
@@ -5210,7 +5212,7 @@ class Router:
 
         fallback_response = None  # rebind-ok: pre-init so finally can close it if a fallback was actually attempted
         try:
-            model_group: Final = cast(str, initial_kwargs.get("model"))  # cast-ok: kwargs always carries the model group
+            model_group: Final = cast(str, initial_kwargs.get("model"))  # cast-ok: model group
             fallbacks: Final[list | None] = initial_kwargs.get(  # mutable-ok: matches the common_utils list|None param
                 "fallbacks", self.fallbacks
             )
@@ -5220,7 +5222,9 @@ class Router:
             content_policy_fallbacks: Final[list | None] = initial_kwargs.get(  # mutable-ok: matches the param below
                 "content_policy_fallbacks", self.content_policy_fallbacks
             )
-            initial_kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_streaming_attempt
+            initial_kwargs["original_function"] = partial(
+                self._ageneric_api_call_with_fallbacks_streaming_attempt, call_type="anthropic_messages"
+            )
             self._update_kwargs_before_fallbacks(
                 model=model_group,
                 kwargs=initial_kwargs,
@@ -5276,7 +5280,9 @@ class Router:
         """Route the request with streaming recovery on each provider attempt."""
         return cast(  # cast-ok: the Messages endpoint determines the generic runner's return shape
             "AnthropicMessagesResponse | AsyncIterator[bytes]",
-            await self._ageneric_api_call_with_fallbacks(model=model, original_function=original_function, **kwargs),
+            await self._ageneric_api_call_with_fallbacks(
+                model=model, original_function=original_function, call_type="anthropic_messages", **kwargs
+            ),
         )
 
     async def _dispatch_generic_call_type(
