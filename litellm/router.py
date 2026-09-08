@@ -21,8 +21,17 @@ import time
 import traceback
 import weakref
 from collections import defaultdict
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Mapping, Sequence
-from functools import lru_cache
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterable,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Generator,
+    Mapping,
+    Sequence,
+)
+from functools import lru_cache, partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, TypeAlias, TypeVar, Union, cast
 
@@ -142,9 +151,11 @@ from litellm.router_utils.cooldown_handlers import (
 )
 from litellm.router_utils.fallback_event_handlers import (
     AttemptedFallbackTargets,
+    StreamFallbackContinuation,
     _check_non_standard_fallback_format,
     get_fallback_model_group,
     run_async_fallback,
+    run_streaming_fallback,
 )
 from litellm.router_utils.get_retry_from_policy import (
     get_num_retries_from_retry_policy as _get_num_retries_from_retry_policy,
@@ -413,31 +424,6 @@ def _anthropic_stream_error_is_gateway_verdict(chunk: object) -> bool:
     return is_server_fulfilled_tool_leak_error(chunk)
 
 
-def _stream_fallback_model_group(initial_kwargs: dict) -> str:
-    """
-    Fallback lookup key for a stream that failed after the router already returned it.
-
-    A fallback hop re-enters the call with ``model`` set to the concrete leg, so
-    ``initial_kwargs["model"]`` names that leg rather than the group the caller asked
-    for. A chain that lists its own primary first (``tier: [primary, alternate]``) then
-    re-selects the primary, whose stream fails at its first chunk; keyed on the leg,
-    the lookup finds no chain and the alternate is never tried, even though the
-    non-streaming path walks the same chain to completion.
-
-    ``async_function_with_fallbacks`` stamps the caller's group as
-    ``original_model_group`` on the first hop and every later hop preserves it, while
-    ``attempted_targets`` records the legs already tried. Continuing the walk from the
-    original group therefore resumes the caller's chain without repeating a leg.
-    """
-    for metadata_key in ("metadata", "litellm_metadata"):
-        metadata: Final = initial_kwargs.get(metadata_key)
-        if isinstance(metadata, dict):
-            original_model_group: Final = metadata.get("original_model_group")
-            if isinstance(original_model_group, str) and original_model_group:
-                return original_model_group
-    return cast(str, initial_kwargs.get("model"))
-
-
 def _anthropic_stream_should_decline_fallback(has_generated_content: bool, error: "MidStreamFallbackError") -> bool:
     """
     A MidStreamFallbackError raised directly by the source iterator (the
@@ -579,6 +565,7 @@ RETRY_BREADCRUMB_EXCLUDED_KWARGS: Final = frozenset(
         "messages",
         "original_function",
         "attempted_targets",
+        "_stream_fallback_continuation",
     )
 )
 
@@ -2510,7 +2497,7 @@ class Router:
                 )
                 try:
                     # Use the router's fallback system
-                    model_group: Final = _stream_fallback_model_group(initial_kwargs)
+                    model_group: Final = cast(str, initial_kwargs.get("model"))
                     fallbacks: Final[list | None] = initial_kwargs.get("fallbacks", self.fallbacks)
                     context_window_fallbacks: Final[list | None] = initial_kwargs.get(
                         "context_window_fallbacks", self.context_window_fallbacks
@@ -2521,20 +2508,24 @@ class Router:
                     initial_kwargs["original_function"] = self._acompletion
                     initial_kwargs["messages"] = messages
                     self._update_kwargs_before_fallbacks(model=model_group, kwargs=initial_kwargs)
-                    fallback_response = await self.async_function_with_fallbacks_common_utils(
-                        e=e,
-                        disable_fallbacks=False,
-                        fallbacks=fallbacks,
-                        context_window_fallbacks=context_window_fallbacks,
-                        content_policy_fallbacks=content_policy_fallbacks,
-                        model_group=model_group,
-                        args=(),
-                        kwargs=initial_kwargs,
-                        include_fallback_errors=initial_kwargs.get("include_fallback_errors", False) is True,
+                    fallback_response = await run_streaming_fallback(
+                        partial(
+                            self.async_function_with_fallbacks_common_utils,
+                            e=e,
+                            disable_fallbacks=False,
+                            fallbacks=fallbacks,
+                            context_window_fallbacks=context_window_fallbacks,
+                            content_policy_fallbacks=content_policy_fallbacks,
+                            model_group=model_group,
+                            args=(),
+                            kwargs=initial_kwargs,
+                            include_fallback_errors=initial_kwargs.get("include_fallback_errors", False) is True,
+                        ),
+                        initial_kwargs.get("_stream_fallback_continuation"),
                     )
 
                     # If fallback returns a streaming response, iterate over it
-                    if hasattr(fallback_response, "__aiter__"):
+                    if isinstance(fallback_response, AsyncIterable):
                         prepared_fallback_hidden_params = Router._prepare_fallback_hidden_params(fallback_response)
                         async for fallback_item in fallback_response:
                             Router._apply_fallback_hidden_params_to_item(fallback_item, prepared_fallback_hidden_params)
@@ -2575,9 +2566,12 @@ class Router:
                                 "stream_with_fallbacks: error closing model_response: %s",
                                 e,
                             )
-                    if fallback_response is not None and hasattr(fallback_response, "aclose"):
+                    fallback_close: Final = getattr(fallback_response, "aclose", None)
+                    if callable(fallback_close):
                         try:
-                            await fallback_response.aclose()
+                            close_result: Final = fallback_close()
+                            if isinstance(close_result, Awaitable):
+                                await close_result
                         except BaseException as e:
                             verbose_router_logger.debug(
                                 "stream_with_fallbacks: error closing fallback_response: %s",
@@ -2914,7 +2908,7 @@ class Router:
             except MidStreamFallbackError as e:
                 partial_usage: Final = Router._extract_partial_responses_usage(source_iterator)
                 try:
-                    model_group: Final = _stream_fallback_model_group(initial_kwargs)
+                    model_group: Final = cast(str, initial_kwargs.get("model"))
                     fallbacks: Final[list | None] = initial_kwargs.get("fallbacks", self.fallbacks)
                     context_window_fallbacks: Final[list | None] = initial_kwargs.get(
                         "context_window_fallbacks", self.context_window_fallbacks
@@ -2927,7 +2921,7 @@ class Router:
                     # _ageneric_api_call_with_fallbacks_helper.
                     # original_generic_function is preserved by the caller so
                     # the helper knows what underlying API to invoke per attempt.
-                    initial_kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
+                    initial_kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_streaming_attempt
                     if e.is_pre_first_chunk or not e.generated_content:
                         # No content generated before the error — retry with the
                         # original input. Adding a continuation prompt would
@@ -2938,6 +2932,11 @@ class Router:
                             initial_kwargs.get("input"),
                             e.generated_content,
                         )
+                        continuation: Final = initial_kwargs.get("_stream_fallback_continuation")
+                        if isinstance(continuation, StreamFallbackContinuation):
+                            initial_kwargs["_stream_fallback_continuation"] = continuation.with_response_input(
+                                initial_kwargs["input"]
+                            )
                     # The Responses-API path stores observability metadata
                     # under "litellm_metadata" (not the default "metadata") —
                     # see _ageneric_api_call_with_fallbacks. Mirroring that
@@ -2948,19 +2947,23 @@ class Router:
                         kwargs=initial_kwargs,
                         metadata_variable_name="litellm_metadata",
                     )
-                    fallback_response = await self.async_function_with_fallbacks_common_utils(
-                        e=e,
-                        disable_fallbacks=False,
-                        fallbacks=fallbacks,
-                        context_window_fallbacks=context_window_fallbacks,
-                        content_policy_fallbacks=content_policy_fallbacks,
-                        model_group=model_group,
-                        args=(),
-                        kwargs=initial_kwargs,
-                        include_fallback_errors=initial_kwargs.get("include_fallback_errors", False) is True,
+                    fallback_response = await run_streaming_fallback(
+                        partial(
+                            self.async_function_with_fallbacks_common_utils,
+                            e=e,
+                            disable_fallbacks=False,
+                            fallbacks=fallbacks,
+                            context_window_fallbacks=context_window_fallbacks,
+                            content_policy_fallbacks=content_policy_fallbacks,
+                            model_group=model_group,
+                            args=(),
+                            kwargs=initial_kwargs,
+                            include_fallback_errors=initial_kwargs.get("include_fallback_errors", False) is True,
+                        ),
+                        initial_kwargs.get("_stream_fallback_continuation"),
                     )
 
-                    if hasattr(fallback_response, "__aiter__"):
+                    if isinstance(fallback_response, AsyncIterable):
                         prepared_fallback_hidden_params = Router._prepare_fallback_hidden_params(fallback_response)
                         async for fallback_item in fallback_response:
                             Router._apply_fallback_hidden_params_to_item(fallback_item, prepared_fallback_hidden_params)
@@ -2987,9 +2990,12 @@ class Router:
                                 "stream_with_fallbacks(aresponses): error closing source: %s",
                                 exc,
                             )
-                    if fallback_response is not None and hasattr(fallback_response, "aclose"):
+                    fallback_close: Final = getattr(fallback_response, "aclose", None)
+                    if callable(fallback_close):
                         try:
-                            await fallback_response.aclose()
+                            close_result: Final = fallback_close()
+                            if isinstance(close_result, Awaitable):
+                                await close_result
                         except BaseException as exc:
                             verbose_router_logger.debug(
                                 "stream_with_fallbacks(aresponses): error closing fallback: %s",
@@ -3054,7 +3060,7 @@ class Router:
                     getattr(complete_response_object, "usage", None),
                 )
                 try:
-                    model_group: Final = _stream_fallback_model_group(initial_kwargs)
+                    model_group: Final = cast(str, initial_kwargs.get("model"))
                     fallbacks: Final[list | None] = initial_kwargs.get("fallbacks", router_self.fallbacks)
                     context_window_fallbacks: Final[list | None] = initial_kwargs.get(
                         "context_window_fallbacks",
@@ -3067,11 +3073,21 @@ class Router:
                     initial_kwargs["original_function"] = router_self._completion
                     initial_kwargs["messages"] = messages
                     router_self._update_kwargs_before_fallbacks(model=model_group, kwargs=initial_kwargs)
-                    fallback_response = router_self.function_with_fallbacks(
-                        **initial_kwargs,
-                        fallbacks=fallbacks,
-                        context_window_fallbacks=context_window_fallbacks,
-                        content_policy_fallbacks=content_policy_fallbacks,
+                    fallback_response = run_async_function(
+                        run_streaming_fallback,
+                        partial(
+                            router_self.async_function_with_fallbacks_common_utils,
+                            e=e,
+                            disable_fallbacks=False,
+                            fallbacks=fallbacks,
+                            context_window_fallbacks=context_window_fallbacks,
+                            content_policy_fallbacks=content_policy_fallbacks,
+                            model_group=model_group,
+                            args=(),
+                            kwargs=initial_kwargs,
+                            include_fallback_errors=initial_kwargs.get("include_fallback_errors", False) is True,
+                        ),
+                        initial_kwargs.get("_stream_fallback_continuation"),
                     )
 
                     if hasattr(fallback_response, "__iter__"):
@@ -4816,7 +4832,11 @@ class Router:
         try:
             kwargs["model"] = model
             kwargs["original_generic_function"] = original_function
-            kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
+            kwargs["original_function"] = (
+                self._ageneric_api_call_with_fallbacks_streaming_attempt
+                if kwargs.get("stream")
+                else self._ageneric_api_call_with_fallbacks_helper
+            )
             self._update_kwargs_before_fallbacks(model=model, kwargs=kwargs, metadata_variable_name="litellm_metadata")
             verbose_router_logger.debug(
                 "Inside ageneric_api_call_with_fallbacks() - model: %s; kwargs: %s", model, kwargs
@@ -4864,6 +4884,40 @@ class Router:
 
             kwargs["endpoint"] = kwargs["endpoint"].replace(model, replacement_model_name)
         return kwargs
+
+    async def _ageneric_api_call_with_fallbacks_streaming_attempt(
+        self,
+        model: str,
+        original_generic_function: Callable[..., Awaitable[object]],
+        **kwargs: object,  # kwargs-ok: preserves the generic endpoint contract while wrapping its stream
+    ) -> object:
+        from litellm.litellm_core_utils.core_helpers import safe_deep_copy
+        from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
+
+        fallback_kwargs: Final[dict[str, object]] = {  # mutable-ok: streaming handlers update retry kwargs in place
+            **kwargs,
+            "model": model,
+            "original_generic_function": original_generic_function,
+            **MappingProxyType(
+                {
+                    key: safe_deep_copy(value)
+                    for key in ("metadata", "litellm_metadata")
+                    if isinstance(value := kwargs.get(key), dict)
+                }
+            ),
+        }
+        response: Final = await self._ageneric_api_call_with_fallbacks_helper(
+            model=model, original_generic_function=original_generic_function, **kwargs
+        )
+        if not kwargs.get("stream"):
+            return response
+        if isinstance(response, BaseResponsesAPIStreamingIterator):
+            return await self._aresponses_streaming_iterator(response=response, initial_kwargs=fallback_kwargs)
+        if getattr(original_generic_function, "__name__", None) == "anthropic_messages" and hasattr(
+            response, "__aiter__"
+        ):
+            return await self._aanthropic_messages_streaming_iterator(response=response, initial_kwargs=fallback_kwargs)
+        return response
 
     async def _ageneric_api_call_with_fallbacks_helper(self, model: str, original_generic_function: Callable, **kwargs):
         """
@@ -4958,52 +5012,13 @@ class Router:
             raise e
 
     async def _aresponses_with_streaming_fallbacks(
-        self, original_function: Callable, **kwargs: Any
+        self, original_function: Callable, model: str, **kwargs: Any
     ) -> Union["ResponsesAPIResponse", "BaseResponsesAPIStreamingIterator"]:
-        """
-        _ageneric_api_call_with_fallbacks for the Responses API, with the
-        addition of mid-stream fallback handling.
-
-        When stream=True and the underlying call returns a
-        BaseResponsesAPIStreamingIterator, wrap it with
-        _aresponses_streaming_iterator so MidStreamFallbackError raised
-        during iteration triggers the Router's cross-provider fallback chain.
-        """
-        from litellm.litellm_core_utils.core_helpers import safe_deep_copy
-        from litellm.responses.streaming_iterator import (
-            BaseResponsesAPIStreamingIterator,
+        """Route the request with streaming recovery on each provider attempt."""
+        return cast(  # cast-ok: the Responses endpoint determines the generic runner's return shape
+            "ResponsesAPIResponse | BaseResponsesAPIStreamingIterator",
+            await self._ageneric_api_call_with_fallbacks(model=model, original_function=original_function, **kwargs),
         )
-
-        # Snapshot the request kwargs before _ageneric_api_call_with_fallbacks
-        # mutates them. A shallow copy alone is not enough: the primary
-        # attempt mutates nested dicts in place — notably `litellm_metadata`,
-        # which `_update_kwargs_with_deployment` populates with
-        # deployment-specific fields (`deployment`, `model_info`, `api_base`,
-        # tags, etc.). Without an explicit copy of that dict, the shallow
-        # copy would still share its reference, leaking primary-deployment
-        # metadata into the mid-stream fallback request.
-        #
-        # We avoid deep-copying the full kwargs because it can contain
-        # non-deepcopyable objects (logging handles, async clients, etc.);
-        # `safe_deep_copy` deep-copies the metadata dicts key-by-key with a
-        # fallback to the original reference for any non-picklable value.
-        # The original_generic_function is preserved so the per-attempt
-        # helper knows which underlying API to call on fallback.
-        fallback_kwargs: Final[dict[str, object]] = kwargs.copy()
-        if isinstance(fallback_kwargs.get("litellm_metadata"), dict):
-            fallback_kwargs["litellm_metadata"] = safe_deep_copy(fallback_kwargs["litellm_metadata"])
-        if isinstance(fallback_kwargs.get("metadata"), dict):
-            fallback_kwargs["metadata"] = safe_deep_copy(fallback_kwargs["metadata"])
-        fallback_kwargs["original_generic_function"] = original_function
-
-        response: Final = await self._ageneric_api_call_with_fallbacks(original_function=original_function, **kwargs)
-
-        if kwargs.get("stream") and isinstance(response, BaseResponsesAPIStreamingIterator):
-            return await self._aresponses_streaming_iterator(
-                response=response,
-                initial_kwargs=fallback_kwargs,
-            )
-        return response
 
     async def _aanthropic_messages_streaming_iterator(
         self,
@@ -5195,7 +5210,7 @@ class Router:
 
         fallback_response = None  # rebind-ok: pre-init so finally can close it if a fallback was actually attempted
         try:
-            model_group: Final = _stream_fallback_model_group(initial_kwargs)
+            model_group: Final = cast(str, initial_kwargs.get("model"))  # cast-ok: kwargs always carries the model group
             fallbacks: Final[list | None] = initial_kwargs.get(  # mutable-ok: matches the common_utils list|None param
                 "fallbacks", self.fallbacks
             )
@@ -5205,27 +5220,31 @@ class Router:
             content_policy_fallbacks: Final[list | None] = initial_kwargs.get(  # mutable-ok: matches the param below
                 "content_policy_fallbacks", self.content_policy_fallbacks
             )
-            initial_kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
+            initial_kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_streaming_attempt
             self._update_kwargs_before_fallbacks(
                 model=model_group,
                 kwargs=initial_kwargs,
                 metadata_variable_name="litellm_metadata",
             )
-            fallback_response = await self.async_function_with_fallbacks_common_utils(  # rebind-ok: set on success
-                e=e,
-                disable_fallbacks=False,
-                fallbacks=fallbacks,
-                context_window_fallbacks=context_window_fallbacks,
-                content_policy_fallbacks=content_policy_fallbacks,
-                model_group=model_group,
-                args=(),
-                kwargs=initial_kwargs,
-                include_fallback_errors=initial_kwargs.get("include_fallback_errors", False) is True,
+            fallback_response = await run_streaming_fallback(  # rebind-ok: set on success for cleanup in finally
+                partial(
+                    self.async_function_with_fallbacks_common_utils,
+                    e=e,
+                    disable_fallbacks=False,
+                    fallbacks=fallbacks,
+                    context_window_fallbacks=context_window_fallbacks,
+                    content_policy_fallbacks=content_policy_fallbacks,
+                    model_group=model_group,
+                    args=(),
+                    kwargs=initial_kwargs,
+                    include_fallback_errors=initial_kwargs.get("include_fallback_errors", False) is True,
+                ),
+                initial_kwargs.get("_stream_fallback_continuation"),
             )
             fallback_hidden_params, fallback_headers = Router._prepare_fallback_hidden_params(fallback_response)
             wrapper.merge_fallback_hidden_params(fallback_hidden_params, fallback_headers)
             wrapper.adopt_fallback_source(fallback_response)
-            if hasattr(fallback_response, "__aiter__"):
+            if isinstance(fallback_response, AsyncIterable):
                 async for fallback_item in fallback_response:
                     yield fallback_item
             else:
@@ -5251,43 +5270,20 @@ class Router:
     async def _aanthropic_messages_with_streaming_fallbacks(
         self,
         original_function: Callable,
+        model: str,
         **kwargs: object,  # kwargs-ok: forwarded verbatim to original_function, shape varies per call site
     ) -> Union["AnthropicMessagesResponse", AsyncIterator[bytes]]:
-        """
-        _ageneric_api_call_with_fallbacks for anthropic_messages, with the
-        addition of mid-stream fallback handling (see
-        _aanthropic_messages_streaming_iterator). Parity with
-        _aresponses_with_streaming_fallbacks for the Responses API.
-        """
-        from litellm.litellm_core_utils.core_helpers import safe_deep_copy
-
-        # Snapshot the request kwargs before the primary attempt mutates them
-        # in place: _update_kwargs_with_deployment writes deployment-specific
-        # fields (deployment, model_info, api_base, tags, ...) into the
-        # SAME litellm_metadata/metadata dicts a shallow .copy() would still
-        # share, leaking primary-deployment metadata into the mid-stream
-        # fallback request. safe_deep_copy avoids deep-copying the full
-        # kwargs (which can hold non-deepcopyable logging handles/clients).
-        fallback_kwargs: Final[dict[str, object]] = kwargs.copy()  # mutable-ok: mutated below before re-entry
-        if isinstance(fallback_kwargs.get("litellm_metadata"), dict):
-            fallback_kwargs["litellm_metadata"] = safe_deep_copy(fallback_kwargs["litellm_metadata"])
-        if isinstance(fallback_kwargs.get("metadata"), dict):
-            fallback_kwargs["metadata"] = safe_deep_copy(fallback_kwargs["metadata"])
-        fallback_kwargs["original_generic_function"] = original_function
-
-        response: Final = await self._ageneric_api_call_with_fallbacks(original_function=original_function, **kwargs)
-
-        if kwargs.get("stream") and hasattr(response, "__aiter__"):
-            return await self._aanthropic_messages_streaming_iterator(
-                response=cast("AsyncIterator[bytes]", response),  # cast-ok: stream=True always returns a byte iterator
-                initial_kwargs=fallback_kwargs,
-            )
-        return response
+        """Route the request with streaming recovery on each provider attempt."""
+        return cast(  # cast-ok: the Messages endpoint determines the generic runner's return shape
+            "AnthropicMessagesResponse | AsyncIterator[bytes]",
+            await self._ageneric_api_call_with_fallbacks(model=model, original_function=original_function, **kwargs),
+        )
 
     async def _dispatch_generic_call_type(
         self,
         call_type: str,
         original_function: Callable,
+        model: str,
         **kwargs: object,  # kwargs-ok: forwarded verbatim to the per-call-type helper, shape varies per call site
     ):
         """
@@ -5299,9 +5295,9 @@ class Router:
         """
         if call_type == "anthropic_messages":
             return await self._aanthropic_messages_with_streaming_fallbacks(
-                original_function=original_function, **kwargs
+                model=model, original_function=original_function, **kwargs
             )
-        return await self._ageneric_api_call_with_fallbacks(original_function=original_function, **kwargs)
+        return await self._ageneric_api_call_with_fallbacks(model=model, original_function=original_function, **kwargs)
 
     def _generic_api_call_with_fallbacks(self, model: str, original_function: Callable, **kwargs):
         """

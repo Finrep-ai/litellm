@@ -278,15 +278,15 @@ async def test_aresponses_with_streaming_fallbacks_wraps_streaming_iterator():
 
     with patch.object(
         router,
-        "_ageneric_api_call_with_fallbacks",
+        "_ageneric_api_call_with_fallbacks_helper",
         new=AsyncMock(return_value=streaming_iter),
     ), patch.object(
         router,
         "_aresponses_streaming_iterator",
         new=AsyncMock(return_value=wrapped),
     ) as mock_wrap:
-        out = await router._aresponses_with_streaming_fallbacks(
-            original_function=fake_original,
+        out = await router._ageneric_api_call_with_fallbacks_streaming_attempt(
+            original_generic_function=fake_original,
             model="primary",
             stream=True,
         )

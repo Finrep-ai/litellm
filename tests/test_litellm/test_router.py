@@ -2349,8 +2349,8 @@ def test_completion_streaming_iterator_fallback_on_429():
 
     with patch.object(
         router,
-        "function_with_fallbacks",
-        return_value=mock_fallback_response,
+        "async_function_with_fallbacks_common_utils",
+        new=AsyncMock(return_value=mock_fallback_response),
     ) as mock_fallback:
         result = router._completion_streaming_iterator(
             model_response=mock_response,
@@ -2363,9 +2363,9 @@ def test_completion_streaming_iterator_fallback_on_429():
         assert mock_fallback.called
         call_kwargs = mock_fallback.call_args
         # Pre-first-chunk: should use original messages, no continuation prompt
-        assert call_kwargs.kwargs.get("messages") == messages
+        assert call_kwargs.kwargs["kwargs"].get("messages") == messages
         # Verify original_function is _completion (sync)
-        assert call_kwargs.kwargs.get("original_function") == router._completion
+        assert call_kwargs.kwargs["kwargs"].get("original_function") == router._completion
 
 
 def test_completion_streaming_iterator_preserves_hidden_params():
@@ -2888,7 +2888,7 @@ async def test_aresponses_streaming_iterator_fallback():
     call_kwargs = mock_fallback_utils.call_args.kwargs
     fbk = call_kwargs["kwargs"]
     # Bound methods compare equal when they share the same instance + __func__.
-    assert fbk["original_function"] == router._ageneric_api_call_with_fallbacks_helper
+    assert fbk["original_function"] == router._ageneric_api_call_with_fallbacks_streaming_attempt
     assert fbk["original_generic_function"] is litellm.aresponses
     assert call_kwargs["model_group"] == "anthropic/claude-sonnet-4-6"
     assert call_kwargs["disable_fallbacks"] is False
@@ -9893,7 +9893,7 @@ async def test_aanthropic_messages_with_streaming_fallbacks_wraps_streaming_iter
     with (
         patch.object(
             router,
-            "_ageneric_api_call_with_fallbacks",
+            "_ageneric_api_call_with_fallbacks_helper",
             new=AsyncMock(return_value=streaming_iter),
         ),
         patch.object(
@@ -9902,8 +9902,8 @@ async def test_aanthropic_messages_with_streaming_fallbacks_wraps_streaming_iter
             new=AsyncMock(return_value=wrapped_marker),
         ) as mock_wrap,
     ):
-        out = await router._aanthropic_messages_with_streaming_fallbacks(
-            original_function=fake_original,
+        out = await router._ageneric_api_call_with_fallbacks_streaming_attempt(
+            original_generic_function=litellm.anthropic_messages,
             model="primary",
             stream=True,
         )
@@ -10130,11 +10130,11 @@ async def test_aanthropic_messages_with_streaming_fallbacks_deep_copies_nested_m
     ):
         with patch.object(
             router,
-            "_ageneric_api_call_with_fallbacks",
+            "_ageneric_api_call_with_fallbacks_helper",
             new=AsyncMock(side_effect=fake_original),
         ):
-            await router._aanthropic_messages_with_streaming_fallbacks(
-                original_function=fake_original,
+            await router._ageneric_api_call_with_fallbacks_streaming_attempt(
+                original_generic_function=litellm.anthropic_messages,
                 model="primary",
                 stream=True,
                 litellm_metadata=primary_metadata,
@@ -10164,11 +10164,11 @@ async def test_aanthropic_messages_with_streaming_fallbacks_deep_copies_metadata
     ):
         with patch.object(
             router,
-            "_ageneric_api_call_with_fallbacks",
+            "_ageneric_api_call_with_fallbacks_helper",
             new=AsyncMock(side_effect=fake_original),
         ):
-            await router._aanthropic_messages_with_streaming_fallbacks(
-                original_function=fake_original,
+            await router._ageneric_api_call_with_fallbacks_streaming_attempt(
+                original_generic_function=litellm.anthropic_messages,
                 model="primary",
                 stream=True,
                 metadata=primary_metadata,
@@ -11532,55 +11532,146 @@ class TestTierParamsTheTargetAccepts:
         assert accepted == {"reasoning_effort": "max"}
 
 
-def _stream_fallback_model_group_cases():
-    from litellm.router import _stream_fallback_model_group
+def _fallback_graph_sse(surface: str, target: str) -> bytes:
+    if target not in ("success", "unused"):
+        error = {"type": "rate_limit_error", "code": "429", "message": "exceeded rate limit"}
+        events = [{"type": "error", "code": "rate_limit_exceeded", "message": "exceeded rate limit", "error": error}]
+    elif surface == "messages":
+        events = [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                },
+            },
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": target}},
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 1},
+            },
+            {"type": "message_stop"},
+        ]
+    elif surface == "responses":
+        response = {
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1,
+            "model": "gpt-4o",
+            "output": [],
+            "status": "completed",
+            "error": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        }
+        events = [
+            {"type": "response.created", "sequence_number": 0, "response": {**response, "status": "in_progress"}},
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "item_id": "msg_test",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": target,
+            },
+            {"type": "response.completed", "sequence_number": 2, "response": response},
+        ]
+    else:
+        events = [
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": target}, "finish_reason": None}],
+            },
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            },
+        ]
+    return "".join(f"event: {event.get('type', 'message')}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
 
-    return _stream_fallback_model_group
 
-
+@pytest.mark.parametrize("surface", ["async-chat", "sync-chat", "responses", "messages"])
+@pytest.mark.parametrize("failure_mode", ["lazy", "eager", "mixed"])
 @pytest.mark.parametrize(
-    "initial_kwargs, expected",
+    "fallbacks, expected_calls, succeeds, max_fallbacks",
     [
-        # Top-level request: no hop stamp yet, the requested model is the group.
-        ({"model": "tier", "metadata": {"model_group": "tier"}}, "tier"),
-        # Fallback hop: `model` is the concrete leg, the caller's group is stamped.
-        ({"model": "azure-sol", "metadata": {"original_model_group": "tier"}}, "tier"),
-        # litellm_metadata bucket (batch/file style callers) is honoured too.
-        ({"model": "azure-sol", "litellm_metadata": {"original_model_group": "tier"}}, "tier"),
-        # Malformed stamp falls back to the model.
-        ({"model": "azure-sol", "metadata": {"original_model_group": ""}}, "azure-sol"),
-        ({"model": "azure-sol", "metadata": None}, "azure-sol"),
+        ([{"tier": ["primary", "success"]}], ["primary", "primary"], True, 10),
+        ([{"tier": ["secondary"]}, {"secondary": ["success"]}], ["primary", "secondary"], True, 10),
+        (
+            [{"tier": ["secondary", "success"]}, {"secondary": ["tertiary"]}, {"tertiary": ["dead"]}],
+            ["primary", "secondary", "tertiary", "dead"],
+            True,
+            10,
+        ),
+        (
+            [{"tier": ["secondary", "unused"]}, {"secondary": ["success"]}],
+            ["primary", "secondary"],
+            True,
+            10,
+        ),
+        (
+            [{"tier": ["secondary", "success"]}, {"secondary": ["tier", "tertiary"]}, {"tertiary": ["secondary"]}],
+            ["primary", "secondary", "tertiary"],
+            True,
+            10,
+        ),
+        ([{"tier": ["secondary"]}, {"secondary": ["tertiary"]}], ["primary", "secondary", "tertiary"], False, 10),
+        ([{"tier": ["secondary", "success"]}], ["primary"], False, 0),
+        ([{"tier": ["secondary"]}], ["primary", "secondary"], False, 1),
     ],
+    ids=["primary-first", "nested", "resume-ancestors", "nested-priority", "cycle", "exhausted", "disabled", "limit"],
 )
-def test_stream_fallback_model_group_prefers_the_callers_original_group(initial_kwargs, expected):
-    assert _stream_fallback_model_group_cases()(initial_kwargs) == expected
-
-
 @pytest.mark.asyncio
-async def test_streaming_fallback_walks_a_chain_that_lists_its_own_primary_first():
-    """A tier whose chain starts with its own primary must still reach the alternate
-    when the primary fails at the first streamed chunk.
+async def test_streaming_fallback_walks_configured_graph(
+    surface, failure_mode, fallbacks, expected_calls, succeeds, max_fallbacks
+):
+    await _assert_streaming_fallback_graph(surface, failure_mode, fallbacks, expected_calls, succeeds, max_fallbacks)
 
-    The first hop re-selects the primary; its stream is returned lazily and only
-    fails once iterated. Keyed on the leg (`azure-sol`) the nested lookup found no
-    chain and the outer wrapper gave up, so a streaming 429 on a tier's primary
-    surfaced to the client while the identical non-streaming call fell back.
-    Keying on the caller's original group resumes the chain past attempted legs.
-    """
-    import json
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+async def _assert_streaming_fallback_graph(surface, failure_mode, fallbacks, expected_calls, succeeds, max_fallbacks):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     calls: list[str] = []
+    requests: list[dict] = []
 
     class RateLimitedStream(BaseHTTPRequestHandler):
         def do_POST(self):
-            raw = self.rfile.read(int(self.headers.get("content-length", 0)))
-            calls.append(self.path)
+            request_body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
+            assert "_stream_fallback_continuation" not in request_body
+            target = self.path.split("/")[1]
+            calls.append(target)
+            requests.append(request_body)
             error = {"error": {"message": "exceeded rate limit", "type": "rate_limit", "code": "429"}}
-            if json.loads(raw or b"{}").get("stream"):
-                # Provider opened the stream, then rejected: the router only sees it on the first chunk.
-                body = ("data: " + json.dumps(error) + "\n\n").encode()
+            if (
+                target in ("success", "unused")
+                or failure_mode in ("lazy", "partial")
+                or (failure_mode == "mixed" and target != "primary")
+            ):
+                body = _fallback_graph_sse(surface, target)
+                if failure_mode == "partial" and target == "secondary":
+                    delta = {
+                        "type": "response.output_text.delta",
+                        "sequence_number": 0,
+                        "item_id": "msg_partial",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": "partial",
+                    }
+                    body = f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n".encode() + body
                 self.send_response(200)
                 self.send_header("content-type", "text/event-stream")
             else:
@@ -11594,36 +11685,74 @@ async def test_streaming_fallback_walks_a_chain_that_lists_its_own_primary_first
         def log_message(self, *args):
             pass
 
-    server = HTTPServer(("127.0.0.1", 0), RateLimitedStream)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RateLimitedStream)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    thread.start()
     try:
         router = litellm.Router(
             model_list=[
                 {
-                    "model_name": "azure-sol",
+                    "model_name": target,
                     "litellm_params": {
-                        "model": "openai/gpt-4o",
+                        "model": "anthropic/claude-sonnet-4-6" if surface == "messages" else "openai/gpt-4o",
                         "api_key": "fake-key",
-                        "api_base": f"http://127.0.0.1:{server.server_address[1]}/v1",
+                        "api_base": f"http://127.0.0.1:{server.server_address[1]}/{target}/v1",
                         "max_retries": 0,
                     },
-                },
-                {
-                    "model_name": "dbx-opus",
-                    "litellm_params": {"model": "openai/gpt-4o", "api_key": "fake-key", "mock_response": "fallback ok"},
-                },
+                }
+                for target in ("primary", "secondary", "tertiary", "dead", "success", "unused")
             ],
-            model_group_alias={"tier": "azure-sol"},
-            fallbacks=[{"tier": ["azure-sol", "dbx-opus"]}],
+            model_group_alias={"tier": "primary"},
+            fallbacks=fallbacks,
             num_retries=0,
+            max_fallbacks=max_fallbacks,
+            disable_cooldowns=True,
         )
 
-        response = await router.acompletion(model="tier", messages=[{"role": "user", "content": "hi"}], stream=True)
-        chunks = [chunk async for chunk in response]
-        text = "".join(chunk.choices[0].delta.content or "" for chunk in chunks)
+        async def consume():
+            request = {"model": "tier", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+            if surface == "messages":
+                response = await router.aanthropic_messages(**request, max_tokens=16)
+                chunks = [chunk async for chunk in response]
+                return "".join(
+                    json.loads(line[6:])["delta"]["text"]
+                    for chunk in chunks
+                    for line in chunk.decode().splitlines()
+                    if line.startswith("data: ") and json.loads(line[6:]).get("type") == "content_block_delta"
+                )
+            if surface == "responses":
+                response = await router.aresponses(model="tier", input="hi", stream=True)
+                chunks = [chunk async for chunk in response]
+                return "".join(chunk.delta for chunk in chunks if chunk.type == "response.output_text.delta")
+            if surface == "sync-chat":
+                response = router.completion(**request)
+                chunks = list(response)
+            else:
+                response = await router.acompletion(**request)
+                chunks = [chunk async for chunk in response]
+            return "".join(chunk.choices[0].delta.content or "" for chunk in chunks)
+
+        if succeeds:
+            assert await consume() == ("partialsuccess" if failure_mode == "partial" else "success")
+        else:
+            with pytest.raises((litellm.RateLimitError, litellm.APIError)):
+                await consume()
+        assert calls == expected_calls + (["success"] if succeeds else [])
+        if failure_mode == "partial":
+            assert requests[-1]["input"][-1] == {"role": "assistant", "type": "message", "content": [{"type": "output_text", "text": "partial"}]}
     finally:
         server.shutdown()
+        server.server_close()
+        thread.join()
 
-    assert text == "fallback ok"
-    # Primary tried for the request and once more as the chain's first leg, then the alternate served.
-    assert len(calls) == 2
+
+@pytest.mark.asyncio
+async def test_responses_streaming_fallback_preserves_continuation_when_resuming_ancestors():
+    await _assert_streaming_fallback_graph(
+        surface="responses",
+        failure_mode="partial",
+        fallbacks=[{"tier": ["secondary", "success"]}, {"secondary": ["tertiary"]}],
+        expected_calls=["primary", "secondary", "tertiary"],
+        succeeds=True,
+        max_fallbacks=10,
+    )
