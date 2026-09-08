@@ -1,9 +1,11 @@
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Final
+from functools import partial
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import litellm
 from litellm._logging import verbose_router_logger
@@ -187,6 +189,44 @@ class AttemptedFallbackTargets:
 
     def record(self, key: str) -> None:
         self.keys = self.keys | frozenset((key,))
+
+
+class StreamFallbackRetry(Protocol):
+    async def __call__(
+        self,
+        *,
+        original_exception: Exception,
+        **kwargs: object,  # kwargs-ok: overrides the saved provider request
+    ) -> object: ...
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class StreamFallbackContinuation:
+    retry: StreamFallbackRetry
+    parent: "StreamFallbackContinuation | None"
+
+    def with_response_input(self, request_input: object) -> "StreamFallbackContinuation":
+        return StreamFallbackContinuation(
+            retry=partial(self.retry, input=request_input),
+            parent=self.parent.with_response_input(request_input) if self.parent is not None else None,
+        )
+
+    async def resume(self, error: Exception) -> object:
+        try:
+            return await self.retry(original_exception=error)
+        except Exception as exhausted:
+            if self.parent is None:
+                raise
+            return await self.parent.resume(exhausted)
+
+
+async def run_streaming_fallback(retry: Callable[[], Awaitable[object]], continuation: object) -> object:
+    try:
+        return await retry()
+    except Exception as exhausted:
+        if not isinstance(continuation, StreamFallbackContinuation):
+            raise
+        return await continuation.resume(exhausted)
 
 
 def _check_stripped_model_group(model_group: str, fallback_key: str) -> bool:
@@ -386,8 +426,21 @@ async def run_async_fallback(
         carried_targets if isinstance(carried_targets, AttemptedFallbackTargets) else AttemptedFallbackTargets()
     )
     attempted.record(original_model_group)
+    carried_continuation: Final = kwargs.get("_stream_fallback_continuation")
+    parent_continuation: Final = (
+        carried_continuation if isinstance(carried_continuation, StreamFallbackContinuation) else None
+    )
 
-    for mg in fallback_model_group:
+    resume_kwargs: Final = MappingProxyType(
+        {
+            **kwargs,
+            "model": original_model_group,
+            "attempted_targets": attempted,
+            "_stream_fallback_continuation": parent_continuation,
+        }
+    )
+
+    for target_index, mg in enumerate(fallback_model_group):
         if mg == original_model_group:
             continue
         if same_model_group_only and _get_fallback_target_model_group(mg) != original_model_group:
@@ -428,6 +481,26 @@ async def run_async_fallback(
             kwargs["fallback_depth"] = fallback_depth
             kwargs["max_fallbacks"] = max_fallbacks
             kwargs["attempted_targets"] = attempted
+            if kwargs.get("stream"):
+                # A returned stream can fail after this loop has exited. Retain its remaining siblings.
+                kwargs["_stream_fallback_continuation"] = StreamFallbackContinuation(
+                    retry=partial(
+                        run_async_fallback,
+                        *args,
+                        **MappingProxyType(
+                            {
+                                **resume_kwargs,
+                                "litellm_router": litellm_router,
+                                "fallback_model_group": fallback_model_group[target_index + 1 :],
+                                "original_model_group": original_model_group,
+                                "max_fallbacks": max_fallbacks,
+                                "fallback_depth": fallback_depth,
+                                "include_fallback_errors": include_fallback_errors,
+                            }
+                        ),
+                    ),
+                    parent=parent_continuation,
+                )
             if include_fallback_errors:
                 kwargs["include_fallback_errors"] = include_fallback_errors
             response = await litellm_router.async_function_with_fallbacks(*args, **kwargs)

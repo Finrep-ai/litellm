@@ -5539,12 +5539,13 @@ async def test_async_post_call_failure_deployment_hook_omits_attempted_targets_f
 
     sentinel_targets = object()
     await async_post_call_failure_deployment_hook(
-        request_data={"model": "gpt-4o-mini", "attempted_targets": sentinel_targets},
+        request_data={"model": "gpt-4o-mini", "attempted_targets": sentinel_targets, "_stream_fallback_continuation": object()},
         exception=ValueError("x"),
         call_type="acompletion",
     )
 
     assert recorder.calls[0][0].get("attempted_targets") is None
+    assert "_stream_fallback_continuation" not in recorder.calls[0][0]
 
 
 @pytest.mark.asyncio

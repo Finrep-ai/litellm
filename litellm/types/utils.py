@@ -3629,6 +3629,7 @@ all_litellm_params = (
         "fallback_depth",
         "max_fallbacks",
         "attempted_targets",
+        "_stream_fallback_continuation",
         "max_budget",
         "budget_duration",
         "use_in_pass_through",
