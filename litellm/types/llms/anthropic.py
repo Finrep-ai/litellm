@@ -51,6 +51,7 @@ class AnthropicMessagesTool(TypedDict, total=False):
     description: str
     input_schema: AnthropicInputSchema | None
     strict: ReadOnly[bool]
+    eager_input_streaming: ReadOnly[bool]
     type: Literal["custom"]
     cache_control: dict | ChatCompletionCachedContent | None
     defer_loading: bool

@@ -2,6 +2,7 @@
 import pytest
 
 from unittest.mock import MagicMock, patch
+from typing import Final
 
 import litellm
 from litellm.constants import (
@@ -14,11 +15,79 @@ from litellm.constants import (
     RESPONSE_FORMAT_TOOL_NAME,
 )
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+from litellm.llms.azure_ai.anthropic.transformation import AzureAnthropicConfig
+from litellm.llms.bedrock.chat.invoke_transformations.anthropic_claude3_transformation import AmazonAnthropicClaudeConfig
+from litellm.llms.bedrock.claude_platform.transformation import BedrockClaudePlatformConfig
+from litellm.llms.vertex_ai.vertex_ai_partner_models.anthropic.transformation import VertexAIAnthropicConfig
 from litellm.llms.anthropic.experimental_pass_through.messages.transformation import (
     AnthropicMessagesConfig,
 )
 from litellm.types.llms.anthropic import ANTHROPIC_BETA_HEADER_VALUES
 from litellm.types.utils import ServerToolUse, Usage
+
+
+@pytest.mark.parametrize(
+    ("config_type", "model"),
+    [
+        (AnthropicConfig, "claude-opus-5"),
+        (AzureAnthropicConfig, "claude-opus-5"),
+        (VertexAIAnthropicConfig, "claude-opus-4-6"),
+        (AmazonAnthropicClaudeConfig, "anthropic.claude-opus-4-6-v1"),
+        (BedrockClaudePlatformConfig, "claude-opus-5"),
+    ],
+)
+@pytest.mark.parametrize("tool_type", ["function", "custom"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("outer", "nested", "expected"),
+    [
+        (None, None, None),
+        (True, None, True),
+        (False, None, False),
+        (None, True, True),
+        (None, False, False),
+        (False, True, False),
+        (True, False, True),
+    ],
+)
+def test_transform_request_preserves_eager_input_streaming(
+    config_type: type[AnthropicConfig],
+    model: str,
+    stream: bool,
+    tool_type: str,
+    outer: bool | None,
+    nested: bool | None,
+    expected: bool | None,
+) -> None:
+    config: Final = config_type()
+    tools: Final = [
+        {
+            "type": tool_type,
+            **({"eager_input_streaming": outer} if outer is not None else {}),
+            "function": {
+                "name": "workspace_write",
+                "parameters": {"type": "object", "properties": {"content": {"type": "string"}}},
+                **({"eager_input_streaming": nested} if nested is not None else {}),
+            },
+        }
+    ]
+    optional_params: Final = config.map_openai_params(
+        non_default_params={"tools": tools, "stream": stream},
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )
+    payload: Final = config.transform_request(
+        model=model,
+        messages=[{"role": "user", "content": "Write a document"}],
+        optional_params=optional_params,
+        litellm_params={},
+        headers={},
+    )
+    if expected is None:
+        assert "eager_input_streaming" not in payload["tools"][0]
+    else:
+        assert payload["tools"][0]["eager_input_streaming"] is expected
 
 
 def test_response_format_transformation_unit_test():

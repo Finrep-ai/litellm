@@ -706,12 +706,24 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             )
 
             input_anthropic_schema: Final = sanitize_input_schema_for_anthropic(_input_schema)
-
-            _tool: Final = AnthropicMessagesTool(
-                name=tool["function"]["name"],
-                input_schema=input_anthropic_schema,
-                type="custom",
+            _eager_input_streaming: Final = (
+                tool["eager_input_streaming"]
+                if "eager_input_streaming" in tool
+                else tool["function"]["eager_input_streaming"]
+                if "eager_input_streaming" in tool["function"]
+                else None
             )
+
+            _eager_tool_options: Final = (
+                AnthropicMessagesTool(name=tool["function"]["name"], eager_input_streaming=_eager_input_streaming)
+                if _eager_input_streaming is not None
+                else AnthropicMessagesTool(name=tool["function"]["name"])
+            )
+            _tool: Final[AnthropicMessagesTool] = {
+                **_eager_tool_options,
+                "input_schema": input_anthropic_schema,
+                "type": "custom",
+            }
 
             _description: Final = tool["function"].get("description")
             if _description is not None:
