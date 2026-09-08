@@ -11530,3 +11530,100 @@ class TestTierParamsTheTargetAccepts:
         accepted = router._tier_params_the_target_accepts("no-such-group", {"reasoning_effort": "max"}, {})
 
         assert accepted == {"reasoning_effort": "max"}
+
+
+def _stream_fallback_model_group_cases():
+    from litellm.router import _stream_fallback_model_group
+
+    return _stream_fallback_model_group
+
+
+@pytest.mark.parametrize(
+    "initial_kwargs, expected",
+    [
+        # Top-level request: no hop stamp yet, the requested model is the group.
+        ({"model": "tier", "metadata": {"model_group": "tier"}}, "tier"),
+        # Fallback hop: `model` is the concrete leg, the caller's group is stamped.
+        ({"model": "azure-sol", "metadata": {"original_model_group": "tier"}}, "tier"),
+        # litellm_metadata bucket (batch/file style callers) is honoured too.
+        ({"model": "azure-sol", "litellm_metadata": {"original_model_group": "tier"}}, "tier"),
+        # Malformed stamp falls back to the model.
+        ({"model": "azure-sol", "metadata": {"original_model_group": ""}}, "azure-sol"),
+        ({"model": "azure-sol", "metadata": None}, "azure-sol"),
+    ],
+)
+def test_stream_fallback_model_group_prefers_the_callers_original_group(initial_kwargs, expected):
+    assert _stream_fallback_model_group_cases()(initial_kwargs) == expected
+
+
+@pytest.mark.asyncio
+async def test_streaming_fallback_walks_a_chain_that_lists_its_own_primary_first():
+    """A tier whose chain starts with its own primary must still reach the alternate
+    when the primary fails at the first streamed chunk.
+
+    The first hop re-selects the primary; its stream is returned lazily and only
+    fails once iterated. Keyed on the leg (`azure-sol`) the nested lookup found no
+    chain and the outer wrapper gave up, so a streaming 429 on a tier's primary
+    surfaced to the client while the identical non-streaming call fell back.
+    Keying on the caller's original group resumes the chain past attempted legs.
+    """
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    calls: list[str] = []
+
+    class RateLimitedStream(BaseHTTPRequestHandler):
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("content-length", 0)))
+            calls.append(self.path)
+            error = {"error": {"message": "exceeded rate limit", "type": "rate_limit", "code": "429"}}
+            if json.loads(raw or b"{}").get("stream"):
+                # Provider opened the stream, then rejected: the router only sees it on the first chunk.
+                body = ("data: " + json.dumps(error) + "\n\n").encode()
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+            else:
+                body = json.dumps(error).encode()
+                self.send_response(429)
+                self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), RateLimitedStream)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        router = litellm.Router(
+            model_list=[
+                {
+                    "model_name": "azure-sol",
+                    "litellm_params": {
+                        "model": "openai/gpt-4o",
+                        "api_key": "fake-key",
+                        "api_base": f"http://127.0.0.1:{server.server_address[1]}/v1",
+                        "max_retries": 0,
+                    },
+                },
+                {
+                    "model_name": "dbx-opus",
+                    "litellm_params": {"model": "openai/gpt-4o", "api_key": "fake-key", "mock_response": "fallback ok"},
+                },
+            ],
+            model_group_alias={"tier": "azure-sol"},
+            fallbacks=[{"tier": ["azure-sol", "dbx-opus"]}],
+            num_retries=0,
+        )
+
+        response = await router.acompletion(model="tier", messages=[{"role": "user", "content": "hi"}], stream=True)
+        chunks = [chunk async for chunk in response]
+        text = "".join(chunk.choices[0].delta.content or "" for chunk in chunks)
+    finally:
+        server.shutdown()
+
+    assert text == "fallback ok"
+    # Primary tried for the request and once more as the chain's first leg, then the alternate served.
+    assert len(calls) == 2

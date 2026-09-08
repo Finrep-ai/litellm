@@ -413,6 +413,31 @@ def _anthropic_stream_error_is_gateway_verdict(chunk: object) -> bool:
     return is_server_fulfilled_tool_leak_error(chunk)
 
 
+def _stream_fallback_model_group(initial_kwargs: dict) -> str:
+    """
+    Fallback lookup key for a stream that failed after the router already returned it.
+
+    A fallback hop re-enters the call with ``model`` set to the concrete leg, so
+    ``initial_kwargs["model"]`` names that leg rather than the group the caller asked
+    for. A chain that lists its own primary first (``tier: [primary, alternate]``) then
+    re-selects the primary, whose stream fails at its first chunk; keyed on the leg,
+    the lookup finds no chain and the alternate is never tried, even though the
+    non-streaming path walks the same chain to completion.
+
+    ``async_function_with_fallbacks`` stamps the caller's group as
+    ``original_model_group`` on the first hop and every later hop preserves it, while
+    ``attempted_targets`` records the legs already tried. Continuing the walk from the
+    original group therefore resumes the caller's chain without repeating a leg.
+    """
+    for metadata_key in ("metadata", "litellm_metadata"):
+        metadata: Final = initial_kwargs.get(metadata_key)
+        if isinstance(metadata, dict):
+            original_model_group: Final = metadata.get("original_model_group")
+            if isinstance(original_model_group, str) and original_model_group:
+                return original_model_group
+    return cast(str, initial_kwargs.get("model"))
+
+
 def _anthropic_stream_should_decline_fallback(has_generated_content: bool, error: "MidStreamFallbackError") -> bool:
     """
     A MidStreamFallbackError raised directly by the source iterator (the
@@ -2485,7 +2510,7 @@ class Router:
                 )
                 try:
                     # Use the router's fallback system
-                    model_group: Final = cast(str, initial_kwargs.get("model"))
+                    model_group: Final = _stream_fallback_model_group(initial_kwargs)
                     fallbacks: Final[list | None] = initial_kwargs.get("fallbacks", self.fallbacks)
                     context_window_fallbacks: Final[list | None] = initial_kwargs.get(
                         "context_window_fallbacks", self.context_window_fallbacks
@@ -2889,7 +2914,7 @@ class Router:
             except MidStreamFallbackError as e:
                 partial_usage: Final = Router._extract_partial_responses_usage(source_iterator)
                 try:
-                    model_group: Final = cast(str, initial_kwargs.get("model"))
+                    model_group: Final = _stream_fallback_model_group(initial_kwargs)
                     fallbacks: Final[list | None] = initial_kwargs.get("fallbacks", self.fallbacks)
                     context_window_fallbacks: Final[list | None] = initial_kwargs.get(
                         "context_window_fallbacks", self.context_window_fallbacks
@@ -3029,7 +3054,7 @@ class Router:
                     getattr(complete_response_object, "usage", None),
                 )
                 try:
-                    model_group: Final = cast(str, initial_kwargs.get("model"))
+                    model_group: Final = _stream_fallback_model_group(initial_kwargs)
                     fallbacks: Final[list | None] = initial_kwargs.get("fallbacks", router_self.fallbacks)
                     context_window_fallbacks: Final[list | None] = initial_kwargs.get(
                         "context_window_fallbacks",
@@ -5170,7 +5195,7 @@ class Router:
 
         fallback_response = None  # rebind-ok: pre-init so finally can close it if a fallback was actually attempted
         try:
-            model_group: Final = cast(str, initial_kwargs.get("model"))  # cast-ok: model group
+            model_group: Final = _stream_fallback_model_group(initial_kwargs)
             fallbacks: Final[list | None] = initial_kwargs.get(  # mutable-ok: matches the common_utils list|None param
                 "fallbacks", self.fallbacks
             )
