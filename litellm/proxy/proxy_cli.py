@@ -567,8 +567,12 @@ class ProxyInitializationHelpers:
         # Optional: how long a SIGTERM lets workers finish in-flight requests
         # before the arbiter kills them (gunicorn's default is 30s). Without it,
         # stopping the container cuts any longer streaming response.
-        graceful_timeout = os.environ.get("GUNICORN_GRACEFUL_TIMEOUT")
+        graceful_timeout = os.environ.get("GUNICORN_GRACEFUL_TIMEOUT", "").strip()
         if graceful_timeout:
+            if not graceful_timeout.isdigit() or int(graceful_timeout) == 0:
+                raise ValueError(
+                    f"GUNICORN_GRACEFUL_TIMEOUT must be a positive integer of seconds, got {graceful_timeout!r}"
+                )
             gunicorn_options["graceful_timeout"] = int(graceful_timeout)
 
         # Clean up prometheus .db files when a worker exits (prevents ghost gauge values)

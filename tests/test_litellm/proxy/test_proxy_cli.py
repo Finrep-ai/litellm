@@ -1413,7 +1413,28 @@ class TestProxyInitializationHelpers:
         assert captured["options"]["max_requests"] == 1000
         assert captured["options"]["max_requests_jitter"] == 50
 
-    @pytest.mark.parametrize("env_value,expected", [(None, 30), ("600", 600)])
+    @pytest.mark.skipif(os.name == "nt", reason="gunicorn server path skips Windows")
+    @pytest.mark.parametrize("env_value", ["600s", "0", "-5", "abc"])
+    def test_gunicorn_graceful_timeout_rejects_bad_values(self, monkeypatch, env_value):
+        """A malformed value fails startup loudly instead of silently killing streams early."""
+        pytest.importorskip("gunicorn")
+        monkeypatch.setenv("GUNICORN_GRACEFUL_TIMEOUT", env_value)
+
+        with (
+            patch("gunicorn.app.base.BaseApplication.run"),
+            pytest.raises(ValueError, match="GUNICORN_GRACEFUL_TIMEOUT"),
+        ):
+            ProxyInitializationHelpers._run_gunicorn_server(
+                host="127.0.0.1",
+                port=4013,
+                app=MagicMock(),
+                num_workers=2,
+                ssl_certfile_path=None,
+                ssl_keyfile_path=None,
+            )
+
+    @pytest.mark.skipif(os.name == "nt", reason="gunicorn server path skips Windows")
+    @pytest.mark.parametrize("env_value,expected", [(None, 30), ("", 30), (" 600 ", 600)])
     def test_gunicorn_graceful_timeout_from_env(self, monkeypatch, env_value, expected):
         """GUNICORN_GRACEFUL_TIMEOUT reaches the arbiter's config; unset keeps gunicorn's 30s.
 
