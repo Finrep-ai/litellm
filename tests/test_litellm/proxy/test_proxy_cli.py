@@ -1413,6 +1413,36 @@ class TestProxyInitializationHelpers:
         assert captured["options"]["max_requests"] == 1000
         assert captured["options"]["max_requests_jitter"] == 50
 
+    @pytest.mark.parametrize("env_value,expected", [(None, 30), ("600", 600)])
+    def test_gunicorn_graceful_timeout_from_env(self, monkeypatch, env_value, expected):
+        """GUNICORN_GRACEFUL_TIMEOUT reaches the arbiter's config; unset keeps gunicorn's 30s.
+
+        This is the window a SIGTERM gives in-flight streams before workers are
+        killed, so it has to land in cfg, not just in the options dict.
+        """
+        pytest.importorskip("gunicorn")
+        if env_value is None:
+            monkeypatch.delenv("GUNICORN_GRACEFUL_TIMEOUT", raising=False)
+        else:
+            monkeypatch.setenv("GUNICORN_GRACEFUL_TIMEOUT", env_value)
+
+        captured: dict = {}
+
+        def capture_run(self):
+            captured["graceful_timeout"] = self.cfg.graceful_timeout
+
+        with patch("gunicorn.app.base.BaseApplication.run", capture_run):
+            ProxyInitializationHelpers._run_gunicorn_server(
+                host="127.0.0.1",
+                port=4012,
+                app=MagicMock(),
+                num_workers=2,
+                ssl_certfile_path=None,
+                ssl_keyfile_path=None,
+            )
+
+        assert captured["graceful_timeout"] == expected
+
     @pytest.mark.skipif(os.name == "nt", reason="gunicorn server path skips Windows")
     def test_gunicorn_jitter_without_base_warns(self):
         """gunicorn path warns when jitter is set without --max_requests_before_restart"""

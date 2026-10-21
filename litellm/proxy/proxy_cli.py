@@ -564,6 +564,13 @@ class ProxyInitializationHelpers:
             else:
                 gunicorn_options["max_requests_jitter"] = max_requests_before_restart_jitter
 
+        # Optional: how long a SIGTERM lets workers finish in-flight requests
+        # before the arbiter kills them (gunicorn's default is 30s). Without it,
+        # stopping the container cuts any longer streaming response.
+        graceful_timeout = os.environ.get("GUNICORN_GRACEFUL_TIMEOUT")
+        if graceful_timeout:
+            gunicorn_options["graceful_timeout"] = int(graceful_timeout)
+
         # Clean up prometheus .db files when a worker exits (prevents ghost gauge values)
         if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
             from litellm.proxy.prometheus_cleanup import mark_worker_exit
